@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
-#![deny(jokler)]
 
 extern crate winapi;
 extern crate term;
@@ -8,13 +7,13 @@ extern crate term;
 #[macro_use]
 extern crate bitflags;
 
-use winapi::um::d3d12::{
+/*use winapi::um::d3d12::{
     D3D12_RESOURCE_STATES,
     D3D12_RESOURCE_STATE_RENDER_TARGET,
     D3D12_RESOURCE_STATE_DEPTH_WRITE,
-    //D3D12_RESOURCE_STATE_DEPTH_READ,
-    //D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-};
+    D3D12_RESOURCE_STATE_DEPTH_READ,
+    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+};*/
 
 bitflags! {
     struct TransitionFlags: u32 {
@@ -25,66 +24,21 @@ bitflags! {
     }
 }
 
-type Node = i32;
-type Edge = (i32, i32, TransitionFlags);
-
-struct NeighboursOut<'a> {
-    owner: Node,
-    edges: &'a [Edge],
-    index: usize
-}
-
-impl<'a> Iterator for NeighboursOut<'a> {
-    type Item = Node;
-
-    fn next(&mut self) -> Option<Node> {
-        while self.index < self.edges.len() {
-            
-            let edge = self.edges[self.index];
-            self.index += 1;
-
-            if edge.0 == self.owner {
-                return Some(edge.1)
-            }
-        }
-
-        None
-    }
-}
-
-struct NeighboursIn<'a> {
-    owner: Node,
-    edges: &'a [Edge],
-    index: usize
-}
-
-impl<'a> Iterator for NeighboursIn<'a> {
-    type Item = Node;
-
-    fn next(&mut self) -> Option<Node> {
-        while self.index < self.edges.len() {
-            
-            let edge = self.edges[self.index];
-            self.index += 1;
-
-            if edge.1 == self.owner {
-                return Some(edge.0)
-            }
-        }
-
-        None
+impl TransitionFlags {
+    fn has_read(self) -> bool {
+        self.intersects(TransitionFlags::SHADER_RESOURCE | TransitionFlags::DEPTH_READ)
     }
 }
 
 // TODO: restructure according to dice slides:
-//         [ ] renderpass holds array of used resources (and direction?, R/W)
-//         [ ] renderpasses is a flat array in framegraph
-//         [ ] resources also flat array, referenced by renderpasses
-//         [ ] compile time:
-//           [ ] iterate over renderpasses:
-//             [ ] compute ref count
-//             [ ] compute first and last user (renderpass)
-//             [ ] compute barriers (between renderpasses ?)
+//         [x] renderpass holds array of used resources (and direction?, R/W)
+//         [x] renderpasses is a flat array in framegraph
+//         [x] resources also flat array, referenced by renderpasses
+//         [/] compile time:
+//           [/] iterate over renderpasses:
+//             [x] compute resource ref count
+//             [x] compute first and last user (renderpass)
+//             [/] compute barriers (between renderpasses ?)
 //         [ ] culling:
 //           [ ] pass.rc += 1 for resource writes
 //           [ ] resource.rc += for resource reads
@@ -95,76 +49,9 @@ impl<'a> Iterator for NeighboursIn<'a> {
 //                 [ ] resource.producer.reads.rc--
 //                 [ ] if resource.producer.reads.rc == 0
 //                   [ ] push to stack
-struct Graph {
-    nodes: Vec<FrameGraphNode>,
-    edges: Vec<Edge>
-}
-
-impl<'a> Graph {
-    pub fn new() -> Self {
-        Graph {
-            nodes: Vec::new(),
-            edges: Vec::new()
-        }
-    }
-
-    pub fn add_pass(&mut self, name: &'static str, transitions: Vec<ResourceTransition>) -> Node {
-        let idx = self.nodes.len() as Node;
-        self.nodes.push(FrameGraphNode::Pass(name, transitions));
-        idx
-    }
-
-    pub fn add_resource(&mut self, resource: FrameGraphResource) -> Node {
-        let pos = self.nodes.iter().position(|n|
-            if let &FrameGraphNode::Resource(res) = n {
-                res == resource
-            } else {
-                false
-            }
-        );
-
-        if let Some(idx) = pos {
-            idx as i32
-        } else {
-            let idx = self.nodes.len() as Node;
-            self.nodes.push(FrameGraphNode::Resource(resource));
-            idx
-        }
-    }
-
-    pub fn add_edge(&mut self, edge: Edge) {
-        self.edges.push(edge);
-    }
-
-    pub fn neighbours_out(&'a self, node: Node) -> NeighboursOut<'a> {
-        debug_assert!((node as usize) < self.nodes.len());
-
-        NeighboursOut {
-            owner: node,
-            edges: &self.edges,
-            index: 0
-        }
-    }
-
-    pub fn neighbours_in(&'a self, node: Node) -> NeighboursIn<'a> {
-        debug_assert!((node as usize) < self.nodes.len());
-
-        NeighboursIn {
-            owner: node,
-            edges: &self.edges,
-            index: 0
-        }
-    }
-}
 
 #[derive(Debug, Default, Copy, Clone, Hash, PartialEq, Eq)]
-struct FrameGraphResource(&'static str, u32, D3D12_RESOURCE_STATES);
-
-#[derive(Debug)]
-enum FrameGraphNode {
-    Pass(&'static str, Vec<ResourceTransition>),
-    Resource(FrameGraphResource),
-}
+struct FrameGraphResource(&'static str, u32);
 
 trait ResourceBinding {
     type PhysicalResource;
@@ -215,15 +102,22 @@ typed_resource_transition!(DepthWriteResource => DepthReadResource);
 
 typed_resource_transition!(DepthReadResource => DepthWriteResource);
 
+struct RenderPass {
+    resources: Vec<(u32, TransitionFlags)>,
+    refcount: u32
+}
+
 struct FrameGraph {
-    graph: Graph,
+    renderpasses: Vec<(RenderPass, Vec<ResourceTransition>)>,
+    resources: Vec<(FrameGraphResource, u32, Option<usize>, Option<usize>)>,
     virtual_offset: u32
 }
 
 impl FrameGraph {
     pub fn new() -> Self {
         FrameGraph {
-            graph: Graph::new(),
+            renderpasses: Vec::new(),
+            resources: Vec::new(),
             virtual_offset: 0,
             //current_pass: 
         }
@@ -240,24 +134,113 @@ impl FrameGraph {
 
         self.virtual_offset = builder.counter;
 
-        let t = builder.transitions.clone();
-        let pass = self.graph.add_pass(name, builder.transitions);
+        self.renderpasses.push((RenderPass {
+            resources: builder.resources,
+            refcount: 0
+        }, Vec::new()));
+        //let pass = self.graph.add_pass(name, builder.transitions);
         
-        for &(resource, transition) in &builder.input {
-            let resource = self.graph.add_resource(resource);
-            self.graph.add_edge((resource, pass, transition));
-        }
+        //for &(resource, transition) in &builder.input {
+            //let resource = self.graph.add_resource(resource);
+            //self.graph.add_edge((resource, pass, transition));
+       // }
 
-        for &(resource, transition) in &builder.output {
-            let resource = self.graph.add_resource(resource);
-            self.graph.add_edge((pass, resource, transition));
-        }
+        //for &(resource, transition) in &builder.output {
+            //let resource = self.graph.add_resource(resource);
+            //self.graph.add_edge((pass, resource, transition));
+        //}
 
         output
     }
 
-    pub fn cull(&mut self) {
+    pub fn compile(&mut self) {
+        for &(ref pass, _) in &self.renderpasses {
+            for resource in &pass.resources {
+                if resource.1.has_read() {
+                    self.resources[resource.0 as usize].1 += 1;
+                }
+            }
+        }
 
+        for (idx, mut resource) in self.resources.iter_mut().enumerate() {
+            let first_use = self.renderpasses.iter().position(|&(ref pass, _)| pass.resources.iter().find(|res| res.0 == idx as u32).is_some());
+            let last_use = self.renderpasses.iter().rposition(|&(ref pass, _)| pass.resources.iter().find(|res| res.0 == idx as u32).is_some());
+
+            resource.2 = first_use;
+            resource.3 = last_use;
+        }
+
+
+        // TODO: do we need multiple vecs to juggle state between passes?
+        //       really need prev_state? probably..
+        let mut transitions = Vec::with_capacity(self.resources.len());
+        for &mut (ref pass, ref mut pass_transitions) in &mut self.renderpasses {
+            for resource in &pass.resources {
+                let transition = resource.1;
+
+                
+                transitions[resource.0 as usize] = resource.1;
+            }
+        }
+
+/*
+        for idx in 0..self.graph.nodes.len() {
+            if let &FrameGraphNode::Resource(resource) = &self.graph.nodes[idx] {
+
+                let mut current_state = TransitionFlags::empty();
+                let mut prev_state = TransitionFlags::empty();
+                let mut cache_node = None;
+
+                for &(from, to, transition) in self.graph.edges.iter() {
+                    if idx == to as usize {
+                        if let Some(node) = cache_node {
+                            if let FrameGraphNode::Pass(name, ref mut transitions) = self.graph.nodes[node as usize] {
+                                transitions.push(ResourceTransition {
+                                    resource: resource,
+                                    from: prev_state,
+                                    to: current_state
+                                });
+
+                                cache_node = Some(from);
+                                prev_state = current_state;
+                                current_state = transition;
+                            }
+                        } else {
+                            if prev_state.is_empty() {
+                                prev_state = transition;
+                            }
+                            current_state = transition;
+                            cache_node = Some(from);
+                        }
+
+                    } else if idx == from as usize {
+                        if current_state.intersects(TransitionFlags::RENDER_TARGET | TransitionFlags::DEPTH_WRITE) {
+                            cache_node = Some(to);
+                            prev_state = current_state;
+                            current_state = transition
+                        }
+
+                        current_state.insert(transition);
+                    }
+                }
+
+                if prev_state != current_state {
+                    if let Some(node) = cache_node {
+                        if let FrameGraphNode::Pass(name, ref mut transitions) = self.graph.nodes[node as usize] {
+                            transitions.push(ResourceTransition {
+                                resource: resource,
+                                from: prev_state,
+                                to: current_state
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+
+
+   */
     }
 
     pub fn dump(&mut self) {
@@ -586,6 +569,70 @@ impl FrameGraph {
     }
 }
 
+// TODO: each placed resource needs to be created with all usages known
+//       ahead of time (RT, DT) and also be able to transition into proper
+//       states (SRV, RTV, DSV)
+//
+// TODO: heap only requires `HEAP_ALLOW_RT_DS`?
+//
+// TODO: strongly typed graph resources? add another i32 for tracking state?
+//       what about views? bake into typed resources at setup-phase?
+#[derive(Debug)]
+struct FrameGraphBuilder {
+    resources: Vec<(u32, TransitionFlags)>,
+    counter: u32,
+}
+
+impl FrameGraphBuilder {
+    fn new(offset: u32) -> Self {
+        FrameGraphBuilder {
+            resources: Vec::new(),
+            counter: offset
+        }
+    }
+
+    fn create_render_target(&mut self, name: &'static str, desc: RenderTargetDesc) -> RenderTargetResource {
+        let virtual_id = self.counter;
+        self.counter += 1;
+        let res = FrameGraphResource(name, virtual_id);
+        self.write(res, TransitionFlags::RENDER_TARGET);
+
+        RenderTargetResource(res)
+    }
+
+    fn create_depth(&mut self, name: &'static str, desc: DepthDesc) -> DepthWriteResource {
+        let virtual_id = self.counter;
+        self.counter += 1;
+        let res = FrameGraphResource(name, virtual_id);
+        self.write(res, TransitionFlags::DEPTH_WRITE);
+
+        DepthWriteResource(res)
+    }
+
+    fn read_srv<T: IntoTypedResource<ShaderResource>>(&mut self, resource: &T) -> ShaderResource {
+        ShaderResource(self.read(resource.get_virtual_resource(), TransitionFlags::SHADER_RESOURCE))
+    }
+
+    fn read_depth<T: IntoTypedResource<DepthReadResource>>(&mut self, resource: &T) -> DepthReadResource {
+        DepthReadResource(self.read(resource.get_virtual_resource(), TransitionFlags::DEPTH_READ))
+    }
+
+    fn write_depth<T: IntoTypedResource<DepthWriteResource>>(&mut self, resource: T) -> DepthWriteResource {
+        DepthWriteResource(self.write(resource.get_virtual_resource(), TransitionFlags::DEPTH_WRITE))
+    }
+
+    fn read(&mut self, resource: FrameGraphResource, transition: TransitionFlags) -> FrameGraphResource {
+        self.resources.push((resource.1, transition));
+        resource
+    }
+
+    fn write(&mut self, resource: FrameGraphResource, transition: TransitionFlags) -> FrameGraphResource {
+        self.resources.push((resource.1, transition));
+        resource
+    }
+}
+
+
 
 
 #[derive(Debug)]
@@ -641,72 +688,6 @@ struct RenderTargetDesc {
     state: InitialResourceState,
 }
 
-// TODO: each placed resource needs to be created with all usages known
-//       ahead of time (RT, DT) and also be able to transition into proper
-//       states (SRV, RTV, DSV)
-//
-// TODO: heap only requires `HEAP_ALLOW_RT_DS`?
-//
-// TODO: strongly typed graph resources? add another i32 for tracking state?
-//       what about views? bake into typed resources at setup-phase?
-#[derive(Debug)]
-struct FrameGraphBuilder {
-    transitions: Vec<ResourceTransition>,
-    input: Vec<(FrameGraphResource, TransitionFlags)>,
-    output: Vec<(FrameGraphResource, TransitionFlags)>,
-    counter: u32,
-}
-
-impl FrameGraphBuilder {
-    fn new(offset: u32) -> Self {
-        FrameGraphBuilder {
-            transitions: Vec::new(),
-            input: Vec::new(),
-            output: Vec::new(),
-            counter: offset
-        }
-    }
-
-    fn create_render_target(&mut self, name: &'static str, desc: RenderTargetDesc) -> RenderTargetResource {
-        let virtual_id = self.counter;
-        self.counter += 1;
-        let res = FrameGraphResource(name, virtual_id, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        self.write(res, TransitionFlags::RENDER_TARGET);
-
-        RenderTargetResource(res)
-    }
-
-    fn create_depth(&mut self, name: &'static str, desc: DepthDesc) -> DepthWriteResource {
-        let virtual_id = self.counter;
-        self.counter += 1;
-        let res = FrameGraphResource(name, virtual_id, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-        self.write(res, TransitionFlags::DEPTH_WRITE);
-
-        DepthWriteResource(res)
-    }
-
-    fn read_srv<T: IntoTypedResource<ShaderResource>>(&mut self, resource: &T) -> ShaderResource {
-        ShaderResource(self.read(resource.get_virtual_resource(), TransitionFlags::SHADER_RESOURCE))
-    }
-
-    fn read_depth<T: IntoTypedResource<DepthReadResource>>(&mut self, resource: &T) -> DepthReadResource {
-        DepthReadResource(self.read(resource.get_virtual_resource(), TransitionFlags::DEPTH_READ))
-    }
-
-    fn write_depth<T: IntoTypedResource<DepthWriteResource>>(&mut self, resource: T) -> DepthWriteResource {
-        DepthWriteResource(self.write(resource.get_virtual_resource(), TransitionFlags::DEPTH_WRITE))
-    }
-
-    fn read(&mut self, resource: FrameGraphResource, transition: TransitionFlags) -> FrameGraphResource {
-        self.input.push((resource, transition));
-        resource
-    }
-
-    fn write(&mut self, resource: FrameGraphResource, transition: TransitionFlags) -> FrameGraphResource {
-        self.output.push((resource, transition));
-        resource
-    }
-}
 
 fn main() {
     let mut fg = FrameGraph::new();
