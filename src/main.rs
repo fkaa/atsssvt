@@ -28,17 +28,21 @@ impl TransitionFlags {
     fn has_read(self) -> bool {
         self.intersects(TransitionFlags::SHADER_RESOURCE | TransitionFlags::DEPTH_READ)
     }
+
+    fn has_write(self) -> bool {
+        self.intersects(TransitionFlags::RENDER_TARGET | TransitionFlags::DEPTH_WRITE)
+    }
 }
 
 // TODO: restructure according to dice slides:
 //         [x] renderpass holds array of used resources (and direction?, R/W)
 //         [x] renderpasses is a flat array in framegraph
 //         [x] resources also flat array, referenced by renderpasses
-//         [/] compile time:
-//           [/] iterate over renderpasses:
+//         [x] compile time:
+//           [x] iterate over renderpasses:
 //             [x] compute resource ref count
 //             [x] compute first and last user (renderpass)
-//             [/] compute barriers (between renderpasses ?)
+//             [x] compute barriers (between renderpasses ?)
 //         [ ] culling:
 //           [ ] pass.rc += 1 for resource writes
 //           [ ] resource.rc += for resource reads
@@ -102,14 +106,25 @@ typed_resource_transition!(DepthWriteResource => DepthReadResource);
 
 typed_resource_transition!(DepthReadResource => DepthWriteResource);
 
+#[derive(Debug)]
 struct RenderPass {
     resources: Vec<(u32, TransitionFlags)>,
     refcount: u32
 }
 
+#[derive(Debug, Copy, Clone)]
+struct ResourceTransition {
+    resource: u32,
+    from: TransitionFlags,
+    to: TransitionFlags
+}
+
 struct FrameGraph {
-    renderpasses: Vec<(RenderPass, Vec<ResourceTransition>)>,
-    resources: Vec<(FrameGraphResource, u32, Option<usize>, Option<usize>)>,
+    renderpasses: Vec<RenderPass>,
+    renderpass_transitions: Vec<Vec<ResourceTransition>>,
+
+    resources: Vec<(u32, TransitionFlags, Option<usize>, Option<usize>)>,
+
     virtual_offset: u32
 }
 
@@ -117,9 +132,9 @@ impl FrameGraph {
     pub fn new() -> Self {
         FrameGraph {
             renderpasses: Vec::new(),
+            renderpass_transitions: Vec::new(),
             resources: Vec::new(),
             virtual_offset: 0,
-            //current_pass: 
         }
     }
 
@@ -134,113 +149,119 @@ impl FrameGraph {
 
         self.virtual_offset = builder.counter;
 
+        self.resources.extend(builder.created.into_iter().map(|(a,b)|(a, b, None, None)));
+
         self.renderpasses.push((RenderPass {
             resources: builder.resources,
             refcount: 0
-        }, Vec::new()));
-        //let pass = self.graph.add_pass(name, builder.transitions);
-        
-        //for &(resource, transition) in &builder.input {
-            //let resource = self.graph.add_resource(resource);
-            //self.graph.add_edge((resource, pass, transition));
-       // }
-
-        //for &(resource, transition) in &builder.output {
-            //let resource = self.graph.add_resource(resource);
-            //self.graph.add_edge((pass, resource, transition));
-        //}
+        }));
 
         output
     }
 
     pub fn compile(&mut self) {
-        for &(ref pass, _) in &self.renderpasses {
+        // TODO: move to builder-phase?
+        for pass in &self.renderpasses {
             for resource in &pass.resources {
                 if resource.1.has_read() {
-                    self.resources[resource.0 as usize].1 += 1;
+                    self.resources[resource.0 as usize].0 += 1;
                 }
             }
         }
 
+        // find first and last usage of a resource
         for (idx, mut resource) in self.resources.iter_mut().enumerate() {
-            let first_use = self.renderpasses.iter().position(|&(ref pass, _)| pass.resources.iter().find(|res| res.0 == idx as u32).is_some());
-            let last_use = self.renderpasses.iter().rposition(|&(ref pass, _)| pass.resources.iter().find(|res| res.0 == idx as u32).is_some());
+            let first_use = self.renderpasses.iter().position(|pass| pass.resources.iter().find(|res| res.0 == idx as u32).is_some());
+            let last_use = self.renderpasses.iter().rposition(|pass| pass.resources.iter().find(|res| res.0 == idx as u32).is_some());
 
             resource.2 = first_use;
             resource.3 = last_use;
         }
 
 
-        // TODO: do we need multiple vecs to juggle state between passes?
-        //       really need prev_state? probably..
-        let mut transitions = Vec::with_capacity(self.resources.len());
-        for &mut (ref pass, ref mut pass_transitions) in &mut self.renderpasses {
+        // generate all transition barriers
+        //
+        // TODO: maybe cull passes before?
+        //
+        let mut current_states = vec![TransitionFlags::empty(); self.resources.len()];
+        let mut prev_states = vec![TransitionFlags::empty(); self.resources.len()];
+        let mut cache_passes = vec![None; self.resources.len()];
+        let mut prev_passes = vec![0usize; self.resources.len()];
+
+        self.renderpass_transitions.resize(self.renderpasses.len(), Vec::new());
+
+        for (i, pass) in self.renderpasses.iter().enumerate() {
             for resource in &pass.resources {
+                let idx = resource.0 as usize;
+
                 let transition = resource.1;
+                let prev_transition = prev_states[idx];
 
-                
-                transitions[resource.0 as usize] = resource.1;
-            }
-        }
-
-/*
-        for idx in 0..self.graph.nodes.len() {
-            if let &FrameGraphNode::Resource(resource) = &self.graph.nodes[idx] {
-
-                let mut current_state = TransitionFlags::empty();
-                let mut prev_state = TransitionFlags::empty();
-                let mut cache_node = None;
-
-                for &(from, to, transition) in self.graph.edges.iter() {
-                    if idx == to as usize {
-                        if let Some(node) = cache_node {
-                            if let FrameGraphNode::Pass(name, ref mut transitions) = self.graph.nodes[node as usize] {
-                                transitions.push(ResourceTransition {
-                                    resource: resource,
-                                    from: prev_state,
-                                    to: current_state
-                                });
-
-                                cache_node = Some(from);
-                                prev_state = current_state;
-                                current_state = transition;
-                            }
-                        } else {
-                            if prev_state.is_empty() {
-                                prev_state = transition;
-                            }
-                            current_state = transition;
-                            cache_node = Some(from);
-                        }
-
-                    } else if idx == from as usize {
-                        if current_state.intersects(TransitionFlags::RENDER_TARGET | TransitionFlags::DEPTH_WRITE) {
-                            cache_node = Some(to);
-                            prev_state = current_state;
-                            current_state = transition
-                        }
-
-                        current_state.insert(transition);
-                    }
-                }
-
-                if prev_state != current_state {
-                    if let Some(node) = cache_node {
-                        if let FrameGraphNode::Pass(name, ref mut transitions) = self.graph.nodes[node as usize] {
-                            transitions.push(ResourceTransition {
-                                resource: resource,
-                                from: prev_state,
-                                to: current_state
+                if transition.has_write() {
+                    if current_states[idx].has_read() {
+                        if let Some(pass_idx) = cache_passes[idx] {
+                            self.renderpass_transitions[pass_idx as usize].push(ResourceTransition {
+                                resource: resource.0,
+                                from: prev_states[idx],
+                                to: current_states[idx]
                             });
+
+                            prev_states[idx] = current_states[idx];
+                            cache_passes[idx] = None;
                         }
                     }
+
+                    if let Some(pass_idx) = cache_passes[idx] {
+                        self.renderpass_transitions[pass_idx as usize].push(ResourceTransition {
+                            resource: resource.0,
+                            from: prev_states[idx],
+                            to: current_states[idx]
+                        });
+
+                        cache_passes[idx] = Some(prev_passes[idx]);
+                        prev_states[idx] = current_states[idx];
+                        current_states[idx] = transition;
+                    } else {
+                        if prev_transition.is_empty() {
+                            prev_states[idx] = transition;
+                        }
+
+                        current_states[idx] = transition;
+                        cache_passes[idx] = Some(i);
+                    }
+                } else {
+                    if current_states[idx].has_write() {
+                        prev_states[idx] = current_states[idx];
+                        cache_passes[idx] = Some(i);
+                        current_states[idx] = transition;
+                    }
+
+                    current_states[idx].insert(transition);
                 }
+
+                prev_passes[idx] = i;
             }
         }
 
 
+        for i in 0..self.resources.len() {
+            let prev_state = prev_states[i];
+            let current_state = current_states[i];
 
-   */
+            if prev_state != current_state {
+                if let Some(pass_idx) = cache_passes[i] {
+                    self.renderpass_transitions[pass_idx].push(ResourceTransition {
+                        resource: i as u32,
+                        from: prev_state,
+                        to: current_state
+                    });
+                }
+            }
+        }
+
+        //println!("Resources: {:#?}", self.resources);
+        //println!("Renderpasses: {:#?}", self.renderpasses);
+        println!("Transitions: {:#?}", self.renderpass_transitions);
     }
 
     pub fn dump(&mut self) {
@@ -579,6 +600,7 @@ impl FrameGraph {
 //       what about views? bake into typed resources at setup-phase?
 #[derive(Debug)]
 struct FrameGraphBuilder {
+    created: Vec<(u32, TransitionFlags)>,
     resources: Vec<(u32, TransitionFlags)>,
     counter: u32,
 }
@@ -586,6 +608,7 @@ struct FrameGraphBuilder {
 impl FrameGraphBuilder {
     fn new(offset: u32) -> Self {
         FrameGraphBuilder {
+            created: Vec::new(),
             resources: Vec::new(),
             counter: offset
         }
@@ -595,6 +618,7 @@ impl FrameGraphBuilder {
         let virtual_id = self.counter;
         self.counter += 1;
         let res = FrameGraphResource(name, virtual_id);
+        self.created.push((virtual_id, TransitionFlags::RENDER_TARGET));
         self.write(res, TransitionFlags::RENDER_TARGET);
 
         RenderTargetResource(res)
@@ -604,6 +628,7 @@ impl FrameGraphBuilder {
         let virtual_id = self.counter;
         self.counter += 1;
         let res = FrameGraphResource(name, virtual_id);
+        self.created.push((virtual_id, TransitionFlags::DEPTH_WRITE));
         self.write(res, TransitionFlags::DEPTH_WRITE);
 
         DepthWriteResource(res)
@@ -652,13 +677,6 @@ enum InitialResourceState {
 enum ResourceState {
     Clear,
     DontCare
-}
-
-#[derive(Debug, Copy, Clone)]
-struct ResourceTransition {
-    resource: FrameGraphResource,
-    from: TransitionFlags,
-    to: TransitionFlags
 }
 
 #[derive(Debug)]
@@ -761,6 +779,7 @@ fn main() {
         }
     );
 
+    fg.compile();
     fg.dump();
 }
 
