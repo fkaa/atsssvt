@@ -43,16 +43,27 @@ impl TransitionFlags {
 //             [x] compute resource ref count
 //             [x] compute first and last user (renderpass)
 //             [x] compute barriers (between renderpasses ?)
-//         [ ] culling:
-//           [ ] pass.rc += 1 for resource writes
-//           [ ] resource.rc += for resource reads
-//           [ ] push resources with rc == 0 to stack
-//             [ ] while !empty():
-//               [ ] pop, resource.producer.rc--
-//               [ ] if resource.producer.rc == 0:
-//                 [ ] resource.producer.reads.rc--
-//                 [ ] if resource.producer.reads.rc == 0
-//                   [ ] push to stack
+//         [/] culling:
+//           [x] pass.rc += 1 for resource writes
+//           [x] resource.rc += for resource reads
+//           [x] push resources with rc == 0 to stack
+//             [/] while !empty():
+//               [?] pop, resource.producer.rc--
+//               [?] if resource.producer.rc == 0:
+//                 [?] resource.producer.reads.rc--
+//                 [?] if resource.producer.reads.rc == 0
+//                   [?] push to stack
+//
+// TODO: prepare for DX12 implementation:
+//         [ ] single large heap
+//         [ ] how to deal with allocation "scheduling"?
+//           * NOTE: large-ish heap with smaller "overflow" heaps?
+//           * NOTE: mostly persistent, allow fragmentation?
+//           * NOTE: manual flag on adding pass?
+//         [ ] get physical size of resources
+//           * NOTE: alignment?
+//         [ ] fix proper creation descriptions 
+//          
 
 #[derive(Debug, Default, Copy, Clone, Hash, PartialEq, Eq)]
 struct FrameGraphResource(&'static str, u32);
@@ -159,16 +170,67 @@ impl FrameGraph {
         output
     }
 
-    pub fn compile(&mut self) {
+    pub fn cull(&mut self) {
         // TODO: move to builder-phase?
-        for pass in &self.renderpasses {
+        for pass in &mut self.renderpasses {
             for resource in &pass.resources {
                 if resource.1.has_read() {
                     self.resources[resource.0 as usize].0 += 1;
+                } else if resource.1.has_write() {
+                    pass.refcount += 1;
                 }
             }
         }
 
+        use ::std::collections::vec_deque::VecDeque;
+
+        // push all resources that are never read to stack
+        let mut unused = VecDeque::new();
+        for (idx, resource) in self.resources.iter().enumerate() {
+            if resource.0 == 0 {
+                unused.push_back(idx);
+            }
+        }
+
+        let mut prune_list = Vec::new();
+
+        loop {
+            // while the stack is not empty,
+            if let Some(resource) = unused.pop_front() {
+
+                // decrease the producers rc (if a pass's outputs are never
+                // read and has no side-effects then it can be culled)
+                let mut producer = &mut self.renderpasses[resource];
+                producer.refcount -= 1;
+               
+                // to cull, we push all of that pass's reads onto the unused
+                // stack (they are now suspects!)
+                //
+                // repeat until stack is empty
+                if producer.refcount == 0 {
+                    prune_list.push(self.resources[resource].2.unwrap());
+
+                    for resource in &producer.resources {
+                        if resource.1.has_read() {
+                            self.resources[resource.0 as usize].0 -= 1;
+                            if self.resources[resource.0 as usize].0 == 0 {
+                                unused.push_back(resource.0 as usize);
+                            }
+                        }
+                    }
+                } 
+            } else {
+                break;
+            }
+        }
+
+        // remove our culled passes
+        for i in prune_list {
+            self.renderpasses.remove(i);
+        }
+    }
+
+    fn find_lifetimes(&mut self) {
         // find first and last usage of a resource
         for (idx, mut resource) in self.resources.iter_mut().enumerate() {
             let first_use = self.renderpasses.iter().position(|pass| pass.resources.iter().find(|res| res.0 == idx as u32).is_some());
@@ -177,8 +239,9 @@ impl FrameGraph {
             resource.2 = first_use;
             resource.3 = last_use;
         }
+    }
 
-
+    fn generate_barriers(&mut self) {
         // generate all transition barriers
         //
         // TODO: maybe cull passes before?
@@ -258,6 +321,29 @@ impl FrameGraph {
                 }
             }
         }
+    }
+
+    pub fn compile(&mut self) {
+
+        use std::time::Instant;
+
+        let now = Instant::now();
+        self.cull();
+        let elapsed = now.elapsed();
+        let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
+        println!("Cull: {}us", sec);
+
+        let now = Instant::now();
+        self.find_lifetimes();
+        let elapsed = now.elapsed();
+        let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
+        println!("Lifetimes: {}us", sec);
+
+        let now = Instant::now();
+        self.generate_barriers();
+        let elapsed = now.elapsed();
+        let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
+        println!("GenBarriers: {}us", sec);
 
         //println!("Resources: {:#?}", self.resources);
         //println!("Renderpasses: {:#?}", self.renderpasses);
@@ -265,328 +351,6 @@ impl FrameGraph {
     }
 
     pub fn dump(&mut self) {
-        
-        // TODO: states can be one write, multiple read (transition into
-        //       required reads in batch and writes in singles)
-        //
-        /*let mut t = term::stdout().unwrap();
-
-        let names = self.graph.nodes.iter()
-            .filter_map(
-                |n| {
-                    if let &FrameGraphNode::Resource(res) = n {
-                        let name = res.0;
-
-                        Some(name.split(' ').map(|s| s.chars().next().unwrap()).collect::<String>())
-                    } else {
-                        None
-                    }
-                }
-            ).collect::<Vec<String>>();
-
-        let padding = 2;
-        let width = names.iter()
-            .fold(0,
-                |max, n| {
-                    max.max(n.len())
-                }
-            ) + padding;
-
-        t.fg(term::color::BRIGHT_WHITE).unwrap();
-
-        for idx in 0..self.graph.nodes.len() {
-            if let &FrameGraphNode::Resource(resource) = &self.graph.nodes[idx] {
-
-                let mut current_state = TransitionFlags::empty();
-                let mut prev_state = TransitionFlags::empty();
-                let mut cache_node = None;
-
-                for &(from, to, transition) in self.graph.edges.iter() {
-                    if idx == to as usize {
-                        if let Some(node) = cache_node {
-                            if let FrameGraphNode::Pass(name, ref mut transitions) = self.graph.nodes[node as usize] {
-                                transitions.push(ResourceTransition {
-                                    resource: resource,
-                                    from: prev_state,
-                                    to: current_state
-                                });
-
-                                cache_node = Some(from);
-                                prev_state = current_state;
-                                current_state = transition;
-                            }
-                        } else {
-                            if prev_state.is_empty() {
-                                prev_state = transition;
-                            }
-                            current_state = transition;
-                            cache_node = Some(from);
-                        }
-
-                    } else if idx == from as usize {
-                        if current_state.intersects(TransitionFlags::RENDER_TARGET | TransitionFlags::DEPTH_WRITE) {
-                            cache_node = Some(to);
-                            prev_state = current_state;
-                            current_state = transition
-                        }
-
-                        current_state.insert(transition);
-                    }
-                }
-
-                if prev_state != current_state {
-                    if let Some(node) = cache_node {
-                        if let FrameGraphNode::Pass(name, ref mut transitions) = self.graph.nodes[node as usize] {
-                            transitions.push(ResourceTransition {
-                                resource: resource,
-                                from: prev_state,
-                                to: current_state
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-
-        let mut resources = 0;
-        let mut positions = Vec::new();
-        let mut created = Vec::new();
-
-        let mut toggle = true;
-        for node in &self.graph.nodes {
-            if let &FrameGraphNode::Resource(id) = node {
-                if toggle {
-                    t.fg(term::color::MAGENTA).unwrap();
-                } else {
-                    t.fg(term::color::BRIGHT_MAGENTA).unwrap();
-                }
-                write!(t, "{}", names[resources]).unwrap();
-                t.reset().unwrap();
-
-                for _ in names[resources].len()..(width + 1) {
-                    write!(t, " ").unwrap();
-                }
-
-                toggle = !toggle;
-                resources += 1;
-                positions.push(id);
-                created.push(false);
-            }
-        }
-        t.fg(term::color::BRIGHT_WHITE).unwrap();
-        write!(t, "   Pass\n").unwrap();
-
-        let nodes = self.graph.nodes.iter();
-
-        for (idx, node) in self.graph.nodes.iter().enumerate() {
-            if let &FrameGraphNode::Pass(name, ref transitions) = node {
-                for transition in transitions {
-                    for i in 0..resources {
-                        if created[i] {
-                            t.bg(term::color::MAGENTA).unwrap();
-                            write!(t, "|").unwrap();
-                            t.reset().unwrap();
-                        } else {
-                            t.fg(term::color::BRIGHT_BLACK).unwrap();
-                            write!(t, ":").unwrap();
-                        }
-                        t.reset().unwrap();
-
-                        for _ in 0..width {
-                            write!(t, " ").unwrap();
-                        }
-                    }
-                    write!(t, "\n").unwrap();
-
-                    for &(from, to, _) in &self.graph.edges {
-                        if from != idx as i32 && to != idx as i32 {
-                            continue;
-                        }
-
-                        let res_idx = if from == idx as i32 {
-                            to
-                        } else if to == idx as i32 {
-                            from
-                        } else {
-                            continue;
-                        };
-
-                        let pos = {
-                            let r = if let FrameGraphNode::Resource(id) = self.graph.nodes[res_idx as usize] {
-                                id 
-                            } else {
-                                continue;
-                            };
-
-                            if r != transition.resource {
-                                continue;
-                            }
-
-                            positions.iter().position(|&res| res == r).unwrap()
-                        };
-
-                        for i in 0..pos {
-                            if created[i] {
-                                t.bg(term::color::MAGENTA).unwrap();
-                                write!(t, "|").unwrap();
-                                t.reset().unwrap();
-                            } else {
-                                write!(t, ":").unwrap();
-                            }
-
-                            for _ in 0..width {
-                                write!(t, " ").unwrap();
-                            }
-                        }
-
-                        t.fg(term::color::BLACK).unwrap();
-                        t.bg(term::color::BRIGHT_YELLOW).unwrap();
-                        write!(t, "#").unwrap();
-                        t.bg(term::color::BRIGHT_YELLOW).unwrap();
-                        write!(t, "<").unwrap();
-                        //t.fg(term::color::BRIGHT_YELLOW).unwrap();
-                        for _ in pos..resources {
-                            for _ in 0..(width+1) {
-                                write!(t, "=").unwrap();
-                            }
-                        }
-                        t.reset().unwrap();
-                        
-                        t.fg(term::color::BRIGHT_WHITE).unwrap();
-                        write!(t, "   Barrier({:?} => {:?})", transition.from, transition.to).unwrap();
-                        t.reset().unwrap();
-                        write!(t, "\n").unwrap();
-
-                    }
-                }
-
-                for &(from, to, _) in &self.graph.edges {
-                    if from != idx as i32 && to != idx as i32 {
-                        continue;
-                    }
-                    for i in 0..resources {
-                        if created[i] {
-                            t.bg(term::color::MAGENTA).unwrap();
-                            write!(t, "|").unwrap();
-                            t.reset().unwrap();
-                        } else {
-                            t.fg(term::color::BRIGHT_BLACK).unwrap();
-                            write!(t, ":").unwrap();
-                        }
-                        t.reset().unwrap();
-
-                        for _ in 0..width {
-                            write!(t, " ").unwrap();
-                        }
-
-                    }
-                    write!(t, "\n").unwrap();
-
-                    enum Operation {
-                        Read,
-                        Write,
-                        Create
-                    };
-
-                    let (op, res_idx) = if from == idx as i32 {
-                        if let Some(n) = self.graph.neighbours_in(to).next() {
-                            if n == from {
-                                (Operation::Create, to)
-                            } else {
-                                (Operation::Write, to)
-                            }
-                        } else {
-                            (Operation::Write, to)
-                        }
-                    } else if to == idx as i32 {
-                        (Operation::Read, from)
-                    } else {
-                        continue;
-                    };
-
-                    let pos = {
-                        let r = if let FrameGraphNode::Resource(id) = self.graph.nodes[res_idx as usize] {
-                            id 
-                        } else {
-                            continue;
-                        };
-
-                        positions.iter().position(|&res| res == r).unwrap()
-                    };
-                    if let Operation::Create = op {
-                        created[pos] = true;
-                    }
-
-                    for i in 0..pos {
-                        if created[i] {
-                            t.bg(term::color::MAGENTA).unwrap();
-                            write!(t, "|").unwrap();
-                            t.reset().unwrap();
-                        } else {
-                            write!(t, ":").unwrap();
-                        }
-
-                        for _ in 0..width {
-                            write!(t, " ").unwrap();
-                        }
-                    }
-                    match op {
-                        Operation::Create => {
-                            t.fg(term::color::BRIGHT_WHITE).unwrap();
-                            t.bg(term::color::MAGENTA).unwrap();
-                            write!(t, "@").unwrap();
-                            t.bg(term::color::RED).unwrap();
-                            write!(t, "<").unwrap();
-                            t.fg(term::color::RED).unwrap();
-                            for _ in pos..resources {
-                                for _ in 0..(width+1) {
-                                    write!(t, "-").unwrap();
-                                }
-                            }
-                            t.reset().unwrap();
-                        },
-                        Operation::Read => {
-                            t.bg(term::color::MAGENTA).unwrap();
-                            write!(t, "|").unwrap();
-                            t.reset().unwrap();
-
-                            t.bg(term::color::GREEN).unwrap();
-                            t.fg(term::color::GREEN).unwrap();
-                            for _ in pos..resources {
-                                for _ in 0..(width+1) {
-                                    write!(t, "-").unwrap();
-                                }
-                            }
-                            t.fg(term::color::BRIGHT_WHITE).unwrap();
-                            write!(t, ">").unwrap();
-                            t.reset().unwrap();
-                        },
-                        Operation::Write => {
-                            t.bg(term::color::MAGENTA).unwrap();
-                            write!(t, "|").unwrap();
-                            t.reset().unwrap();
-
-
-                            t.bg(term::color::RED).unwrap();
-                            write!(t, "<").unwrap();
-                            t.fg(term::color::RED).unwrap();
-                            for _ in pos..resources {
-                                for _ in 0..(width+1) {
-                                    write!(t, "-").unwrap();
-                                }
-                            }
-                            t.reset().unwrap();
-                        }
-                    };
-                    
-                    t.fg(term::color::BRIGHT_WHITE).unwrap();
-                    write!(t, " {}", name).unwrap();
-                    t.reset().unwrap();
-                    write!(t, "\n").unwrap();
-                }
-            }
-        }*/
     }
 }
 
