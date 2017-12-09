@@ -55,6 +55,7 @@ impl TransitionFlags {
 //                   [?] push to stack
 //
 // TODO: prepare for DX12 implementation:
+//         [ ] move device creation into main
 //         [ ] single large heap
 //         [ ] how to deal with allocation "scheduling"?
 //           * NOTE: large-ish heap with smaller "overflow" heaps?
@@ -64,7 +65,14 @@ impl TransitionFlags {
 //           [/] just need to supply the correct D3D12 resource desc
 //         [ ] fix proper creation descriptions 
 //          
-
+//
+//         NOTE: how to do alloc:
+//                * find all resource size bins
+//                  * find candidate by looking at bins with size >= res.size
+//                  * if lifetimes dont overlap, alias, with some heuristic (
+//                    more bytes saves by aliasing? maybe some rect-fitting
+//                    alg that works)
+//
 #[derive(Debug, Default, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct FrameGraphResource(&'static str, u32);
 
@@ -74,6 +82,9 @@ pub trait ResourceBinding {
     fn get_virtual_resource(&self) -> FrameGraphResource;
 }
 
+pub trait IntoTypedResource<T> {
+    fn get_virtual_resource(&self) -> FrameGraphResource;
+}
 
 macro_rules! physical_resource_bind {
     ($name:ident => $physical:ty) => {
@@ -89,16 +100,6 @@ macro_rules! physical_resource_bind {
     }
 }
 
-physical_resource_bind!(RenderTargetResource => ());
-physical_resource_bind!(ShaderResource => ());
-physical_resource_bind!(DepthStencilResource => ());
-physical_resource_bind!(DepthReadResource => ());
-physical_resource_bind!(DepthWriteResource => ());
-
-pub trait IntoTypedResource<T> {
-    fn get_virtual_resource(&self) -> FrameGraphResource;
-}
-
 macro_rules! typed_resource_transition {
     ($type:ty => $target:ty) => {
         impl IntoTypedResource<$target> for $type {
@@ -109,12 +110,16 @@ macro_rules! typed_resource_transition {
     }
 }
 
+physical_resource_bind!(RenderTargetResource => ());
+physical_resource_bind!(ShaderResource => ());
+physical_resource_bind!(DepthStencilResource => ());
+physical_resource_bind!(DepthReadResource => ());
+physical_resource_bind!(DepthWriteResource => ());
+
 typed_resource_transition!(RenderTargetResource => ShaderResource);
 typed_resource_transition!(DepthReadResource => ShaderResource);
 typed_resource_transition!(DepthWriteResource => ShaderResource);
-
 typed_resource_transition!(DepthWriteResource => DepthReadResource);
-
 typed_resource_transition!(DepthReadResource => DepthWriteResource);
 
 #[derive(Debug)]
@@ -136,7 +141,7 @@ pub struct FrameGraph {
     renderpasses: Vec<RenderPass>,
     renderpass_transitions: Vec<Vec<ResourceTransition>>,
 
-    resources: Vec<(u32, TransitionFlags, Option<usize>, Option<usize>)>,
+    resources: Vec<(u32, TransitionFlags, Option<usize>, Option<usize>, &'static str)>,
 
     virtual_offset: u32
 }
@@ -209,11 +214,11 @@ impl FrameGraph {
                 let alloc_info = (*self.device).GetResourceAllocationInfo(0, 1, &desc as *const _);
 
                 println!("{:?}: ", name);
-                println!("Allocation Info: {:?} KiB, {:?}", alloc_info.SizeInBytes / 1024, alloc_info.Alignment);
+                println!("Allocation Info: {:?} KiB, {:?}", alloc_info.SizeInBytes , alloc_info.Alignment);
             }
         }
 
-        self.resources.extend(builder.created.into_iter().map(|(_,a,b,_)|(a, b, None, None)));
+        self.resources.extend(builder.created.into_iter().map(|(n,a,b,_)|(a, b, None, None, n)));
 
         self.renderpasses.push((RenderPass {
             resources: builder.resources,
@@ -456,8 +461,6 @@ impl FrameGraphBuilder {
 
         self.created.push((name, virtual_id, TransitionFlags::RENDER_TARGET, resource_desc));
         self.write(res, TransitionFlags::RENDER_TARGET);
-
-
 
         RenderTargetResource(res)
     }
