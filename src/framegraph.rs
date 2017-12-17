@@ -135,13 +135,30 @@ struct ResourceTransition {
     to: TransitionFlags
 }
 
+#[derive(Debug, Copy, Clone)]
+pub struct TransientResourceLifetime {
+    pub start: u32,
+    pub end: u32
+}
+
+#[derive(Debug)]
+pub struct TransientResource {
+    refcount: u32,
+    usage: TransitionFlags,
+    lifetime: TransientResourceLifetime,
+    size: u64,
+    alignment: u64,
+    name: &'static str
+}
+
 pub struct FrameGraph {
     device: *mut ID3D12Device,
 
     renderpasses: Vec<RenderPass>,
     renderpass_transitions: Vec<Vec<ResourceTransition>>,
 
-    resources: Vec<(u32, TransitionFlags, Option<usize>, Option<usize>, &'static str)>,
+// (u32, TransitionFlags, Option<usize>, Option<usize>, &'static str)
+    resources: Vec<TransientResource>,
 
     virtual_offset: u32
 }
@@ -209,16 +226,24 @@ impl FrameGraph {
 
         self.virtual_offset = builder.counter;
 
-        for &(name, _, _, desc) in &builder.created {
-            unsafe {
-                let alloc_info = (*self.device).GetResourceAllocationInfo(0, 1, &desc as *const _);
+        let device = self.device;
 
-                println!("{:?}: ", name);
-                println!("Allocation Info: {:?} KiB, {:?}", alloc_info.SizeInBytes , alloc_info.Alignment);
+        self.resources.extend(builder.created.into_iter().map(|(n,a,b,desc)| {
+            let (size, alignment) = unsafe {
+                let alloc_info = (*device).GetResourceAllocationInfo(0, 1, &desc as *const _);
+
+                (alloc_info.SizeInBytes, alloc_info.Alignment)
+            };
+
+            TransientResource {
+                refcount: 0,
+                usage: b,
+                lifetime: TransientResourceLifetime { start: 0, end: 0 },
+                size: size as _,
+                alignment: alignment as _,
+                name: n
             }
-        }
-
-        self.resources.extend(builder.created.into_iter().map(|(n,a,b,_)|(a, b, None, None, n)));
+        }));
 
         self.renderpasses.push((RenderPass {
             resources: builder.resources,
@@ -233,7 +258,7 @@ impl FrameGraph {
         for pass in &mut self.renderpasses {
             for resource in &pass.resources {
                 if resource.1.has_read() {
-                    self.resources[resource.0 as usize].0 += 1;
+                    self.resources[resource.0 as usize].refcount += 1;
                 } else if resource.1.has_write() {
                     pass.refcount += 1;
                 }
@@ -245,7 +270,7 @@ impl FrameGraph {
         // push all resources that are never read to stack
         let mut unused = VecDeque::new();
         for (idx, resource) in self.resources.iter().enumerate() {
-            if resource.0 == 0 {
+            if resource.refcount == 0 {
                 unused.push_back(idx);
             }
         }
@@ -266,12 +291,12 @@ impl FrameGraph {
                 //
                 // repeat until stack is empty
                 if producer.refcount == 0 {
-                    prune_list.push(self.resources[resource].2.unwrap());
+                    prune_list.push(self.resources[resource].lifetime.start);
 
                     for resource in &producer.resources {
                         if resource.1.has_read() {
-                            self.resources[resource.0 as usize].0 -= 1;
-                            if self.resources[resource.0 as usize].0 == 0 {
+                            self.resources[resource.0 as usize].refcount -= 1;
+                            if self.resources[resource.0 as usize].refcount == 0 {
                                 unused.push_back(resource.0 as usize);
                             }
                         }
@@ -282,9 +307,10 @@ impl FrameGraph {
             }
         }
 
+        // TODO: sort prune list so we delete in right order
         // remove our culled passes
         for i in prune_list {
-            self.renderpasses.remove(i);
+            self.renderpasses.remove(i as usize);
         }
     }
 
@@ -294,8 +320,10 @@ impl FrameGraph {
             let first_use = self.renderpasses.iter().position(|pass| pass.resources.iter().find(|res| res.0 == idx as u32).is_some());
             let last_use = self.renderpasses.iter().rposition(|pass| pass.resources.iter().find(|res| res.0 == idx as u32).is_some());
 
-            resource.2 = first_use;
-            resource.3 = last_use;
+            resource.lifetime = TransientResourceLifetime {
+                start: first_use.unwrap() as u32,
+                end: last_use.unwrap() as u32
+            };
         }
     }
 
@@ -402,6 +430,9 @@ impl FrameGraph {
         let elapsed = now.elapsed();
         let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
         println!("GenBarriers: {}us", sec);
+
+        use alloc::HeapMemoryAllocator;
+        HeapMemoryAllocator::with_resources(self.resources.iter().map(|r| (r.size, r.lifetime)).collect::<Vec<_>>());
 
         //println!("Resources: {:#?}", self.resources);
         //println!("Renderpasses: {:#?}", self.renderpasses);

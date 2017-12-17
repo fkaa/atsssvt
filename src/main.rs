@@ -15,6 +15,7 @@ extern crate bitflags;
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
 };*/
 
+mod alloc;
 mod framegraph;
 
 use framegraph::*;
