@@ -89,21 +89,89 @@ pub struct HeapMemoryAllocator {
 }
 
 impl HeapMemoryAllocator {
-    pub fn with_resources(mut resources: Vec<(u64, TransientResourceLifetime)>) {
+    pub fn with_resources(mut resources: Vec<(u64, TransientResourceLifetime)>) -> Vec<HeapBin> {
         resources.sort_by(|a, b| (b.0).cmp(&a.0));
         let mut bins = resources.iter().map(|&(sz, _)| HeapBin::new(sz)).collect::<Vec<HeapBin>>();
         
         'r: for resource in &resources {
             for bin in &mut bins {
-                if let Some(offset) = bin.insert(resource.1, resource.0) {
-                    println!("{:?}", offset);
-
+                if let Some(_) = bin.insert(resource.1, resource.0) {
                     continue 'r;
                 }
             }
         }
 
-        println!("{:#?}", bins);
+        //Self::dump(&bins);
+
+        //println!("{:#?}", bins);
+        bins
+    }
+
+    fn dump(bins: &Vec<HeapBin>) {
+        use svg;
+
+        let node = svg::node::element::Rectangle::new()
+            .set("x", 20)
+            .set("y", 20)
+            .set("width", 40)
+            .set("height", 40);
+
+        let heap_width = 500f64;
+        let heap_height = 80f64;
+        let padding = 10f64;
+
+        let mut doc = svg::Document::new();
+        let max_height = bins.iter().map(|b|b.size).max().unwrap() as f64;
+        let max_width = bins.iter().map(|b|b.elements.iter().map(|e|e.end).max().unwrap_or(0)).max().unwrap() as f64;
+
+        doc = doc.set("stroke", "black").set("stroke-width", 1);
+
+        let mut y = padding;
+        for bin in bins {
+            let height = bin.size as f64 / max_height as f64 * heap_height;
+
+            let node = svg::node::element::Rectangle::new()
+                    .set("x", 0)
+                    .set("y", y)
+                    .set("width", heap_width)
+                    .set("height", height)
+                    .set("fill", "transparent")
+                    .set("stroke", "black")
+                    .set("stroke-width", 1);
+            doc = doc.add(node);
+
+            for region in &bin.elements {
+                let size = region.size;
+
+                let xoff = region.start as f64 / max_width as f64 * heap_width;
+                let yoff = region.offset as f64 / bin.size as f64 * height;
+                let w = (region.end - region.start) as f64 / max_width * heap_width;
+                let h = region.size as f64 / bin.size as f64 * height;
+
+                let mut node = svg::node::element::Rectangle::new()
+                    .set("x", xoff)
+                    .set("y", y + yoff)
+                    .set("width", w)
+                    .set("height", h)
+                    .set("fill", "green")
+                    .set("stroke", "black")
+                    .set("stroke-width", 1);
+
+                let text = svg::node::Text::new("Test");
+                let mut title = svg::node::element::Text::new()
+                    .set("x", 0)
+                    .set("y", 0)
+                    .set("font-family", "monospace");
+                title = title.add(text);
+                node = node.add(title);
+
+                doc = doc.add(node);
+            }
+
+            y += height + padding;
+        }
+
+        svg::save("memory.svg", &doc).unwrap();
     }
 
     pub fn alloc(size: usize, begin: u32, end: u32) {

@@ -431,12 +431,16 @@ impl FrameGraph {
         let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
         println!("GenBarriers: {}us", sec);
 
+        let now = Instant::now();
         use alloc::HeapMemoryAllocator;
-        HeapMemoryAllocator::with_resources(self.resources.iter().map(|r| (r.size, r.lifetime)).collect::<Vec<_>>());
+        let bins = HeapMemoryAllocator::with_resources(self.resources.iter().map(|r| (r.size, r.lifetime)).collect::<Vec<_>>());
+        let elapsed = now.elapsed();
+        let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
+        println!("PackHeaps: {}us", sec);
 
         //println!("Resources: {:#?}", self.resources);
         //println!("Renderpasses: {:#?}", self.renderpasses);
-        println!("Transitions: {:#?}", self.renderpass_transitions);
+        println!("Bins: {:#?}", bins);
     }
 
     pub fn dump(&mut self) {
@@ -448,9 +452,6 @@ impl FrameGraph {
 //       states (SRV, RTV, DSV)
 //
 // TODO: heap only requires `HEAP_ALLOW_RT_DS`?
-//
-// TODO: strongly typed graph resources? add another i32 for tracking state?
-//       what about views? bake into typed resources at setup-phase?
 //#[derive(Debug)]
 pub struct FrameGraphBuilder {
     device: *mut ID3D12Device,
@@ -549,32 +550,32 @@ impl FrameGraphBuilder {
 
 
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum TextureSize {
     Full,
     Half,
     Explicit(u32, u32)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum InitialResourceState {
     Clear,
     DontCare
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum ResourceState {
     Clear,
     DontCare
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum DepthFormat {
     D32,
     D24
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct DepthDesc {
     pub format: DepthFormat,
     pub size: TextureSize,
@@ -608,7 +609,7 @@ impl From<TextureFormat> for DXGI_FORMAT {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct RenderTargetDesc {
     pub format: TextureFormat,
     pub size: TextureSize,

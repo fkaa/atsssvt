@@ -3,6 +3,7 @@
 
 extern crate winapi;
 extern crate term;
+extern crate svg;
 
 #[macro_use]
 extern crate bitflags;
@@ -41,7 +42,7 @@ fn main() {
     );
 
     // ambient occlusion
-    let ao = fg.add_pass(
+    let (ao_x, ao_y) = fg.add_pass(
         "SSAO",
         |builder| {
             builder.read_srv(&depth);
@@ -52,18 +53,21 @@ fn main() {
                 mip_levels: 1,
                 state: InitialResourceState::Clear
             };
-            builder.create_render_target("Raw Occlusion", desc)
+
+            (builder.create_render_target("Raw Occlusion #1", desc),
+             builder.create_render_target("Raw Occlusion #2", desc))
         },
         |_| {
 
         }
     );
 
-    let (color, depth, ao) = fg.add_pass(
+    let (color, depth, ao_x, ao_y) = fg.add_pass(
         "Forward",
         |builder| {
             let depth = builder.read_depth(&depth);
-            let ao = builder.read_srv(&ao);
+            let ao_x = builder.read_srv(&ao_x);
+            let ao_y = builder.read_srv(&ao_y);
 
             let desc = RenderTargetDesc {
                 format: TextureFormat::RGBA8,
@@ -72,7 +76,7 @@ fn main() {
                 state: InitialResourceState::Clear
             };
 
-            (builder.create_render_target("Color", desc), depth, ao)
+            (builder.create_render_target("Color", desc), depth, ao_x, ao_y)
         },
         |_| {
 

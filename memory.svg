@@ -1,0 +1,26 @@
+<svg stroke="black" stroke-width="1" xmlns="http://www.w3.org/2000/svg">
+<rect fill="transparent" height="80" stroke="black" stroke-width="1" width="500" x="0" y="10"/>
+<rect fill="green" height="80" stroke="black" stroke-width="1" width="500" x="0" y="10">
+<text font-family="monospace" x="0" y="0">
+Test
+</text>
+</rect>
+<rect fill="transparent" height="80" stroke="black" stroke-width="1" width="500" x="0" y="100"/>
+<rect fill="green" height="80" stroke="black" stroke-width="1" width="166.66666666666666" x="333.3333333333333" y="100">
+<text font-family="monospace" x="0" y="0">
+Test
+</text>
+</rect>
+<rect fill="green" height="20" stroke="black" stroke-width="1" width="166.66666666666666" x="166.66666666666666" y="100">
+<text font-family="monospace" x="0" y="0">
+Test
+</text>
+</rect>
+<rect fill="green" height="20" stroke="black" stroke-width="1" width="166.66666666666666" x="166.66666666666666" y="120">
+<text font-family="monospace" x="0" y="0">
+Test
+</text>
+</rect>
+<rect fill="transparent" height="20" stroke="black" stroke-width="1" width="500" x="0" y="190"/>
+<rect fill="transparent" height="20" stroke="black" stroke-width="1" width="500" x="0" y="220"/>
+</svg>
