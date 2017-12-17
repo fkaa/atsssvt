@@ -20,9 +20,9 @@ impl MemoryRegion {
 
     pub fn intersects(&self, other: MemoryRegion) -> bool {
         self.start < other.end &&
-        self.offset > other.offset + other.size &&
         self.end > other.start &&
-        self.offset + self.size < other.offset
+        self.offset < other.offset + other.size &&
+        self.offset + self.size > other.offset
     }
 }
 
@@ -44,11 +44,6 @@ impl HeapBin {
 
     fn occupied(&self, newregion: MemoryRegion) -> bool {
         for &region in &self.elements {
-            println!("{}", "compare: ");
-            println!("x1: {:?}, y1: {:?}, x2: {:?}, y2: {:?}", newregion.start, newregion.offset, newregion.end, newregion.offset + newregion.size);
-            println!("x1: {:?}, y1: {:?}, x2: {:?}, y2: {:?}", region.start, region.offset, region.end, region.offset + region.size);
-            println!("{:?}", newregion.intersects(region));
-
             if newregion.intersects(region) {
                 return true;
             }
@@ -93,10 +88,6 @@ pub struct HeapMemoryAllocator {
     bins: Vec<HeapBin>
 }
 
-// TODO: implement shelf packing, with bins for each possible resource heap
-//       size. sort bins from highest to lowest, and insert resources with
-//       (x, y, w, h) mapped as (lt.start, offset, lt.end, size). offset is
-//       given by waste map. sort resource by size as well?
 impl HeapMemoryAllocator {
     pub fn with_resources(mut resources: Vec<(u64, TransientResourceLifetime)>) {
         resources.sort_by(|a, b| (b.0).cmp(&a.0));
