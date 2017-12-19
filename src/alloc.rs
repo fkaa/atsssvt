@@ -1,4 +1,7 @@
-use framegraph::TransientResourceLifetime;
+use framegraph::{
+    TransientResource,
+    TransientResourceLifetime
+};
 
 #[derive(Debug, Copy, Clone)]
 pub struct MemoryRegion {
@@ -84,27 +87,84 @@ impl HeapBin {
     }
 }
 
+#[derive(Debug)]
+pub struct HeapMemoryCacheEntry {
+    hash: u64,
+    bins: Vec<HeapBin>,
+    indices: Vec<usize>
+}
+
+impl HeapMemoryCacheEntry {
+    pub fn new() -> Self {
+        HeapMemoryCacheEntry {
+            hash: 0u64,
+            bins: Vec::new(),
+            indices: Vec::new()
+        }
+    }
+
+    pub fn find_resource(&self, resource: usize) -> &HeapBin {
+        &self.bins[self.indices[resource]]
+    }
+}
+
 pub struct HeapMemoryAllocator {
-    bins: Vec<HeapBin>
+    cache: [HeapMemoryCacheEntry; 8],
 }
 
 impl HeapMemoryAllocator {
-    pub fn with_resources(mut resources: Vec<(u64, TransientResourceLifetime)>) -> Vec<HeapBin> {
-        resources.sort_by(|a, b| (b.0).cmp(&a.0));
+    pub fn new() -> Self {
+        HeapMemoryAllocator {
+            cache: [HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new()]
+        }
+    }
+
+    fn find_entry(&self, hash: u64) -> Option<usize> {
+        self.cache.iter().position(|entry| entry.hash == hash)
+    }
+
+    fn push_entry(&mut self, hash: u64, resources: Vec<(u64, TransientResourceLifetime)>) -> &HeapMemoryCacheEntry {
         let mut bins = resources.iter().map(|&(sz, _)| HeapBin::new(sz)).collect::<Vec<HeapBin>>();
-        
-        'r: for resource in &resources {
-            for bin in &mut bins {
+        let mut indices = vec![0usize; resources.len()];
+
+        'r: for (idx, resource) in resources.iter().enumerate() {
+            for (bin_idx, bin) in bins.iter_mut().enumerate() {
                 if let Some(_) = bin.insert(resource.1, resource.0) {
+                    indices[idx] = bin_idx;
                     continue 'r;
                 }
             }
         }
 
-        //Self::dump(&bins);
+        for i in 0..7 {
+            self.cache.swap(7 - i, 7 - i - 1);
+        }
 
-        //println!("{:#?}", bins);
-        bins
+        self.cache[0] = HeapMemoryCacheEntry {
+            hash: hash,
+            bins: bins,
+            indices: indices
+        };
+
+        &self.cache[0]
+    }
+
+    pub fn pack_heap(&mut self, resources: &Vec<TransientResource>) -> &HeapMemoryCacheEntry {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        resources.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        if let Some(entry) = self.find_entry(hash) {
+            &self.cache[entry]
+        } else {
+            let mut resources = resources.iter().map(|r| (r.size, r.lifetime)).collect::<Vec<_>>();
+            resources.sort_by(|a, b| (b.0).cmp(&a.0));
+
+            self.push_entry(hash, resources)
+        }
     }
 
     fn dump(bins: &Vec<HeapBin>) {

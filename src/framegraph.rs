@@ -15,6 +15,8 @@ use winapi::Interface;
 use std::ptr;
 use std::mem;
 
+use alloc::HeapMemoryAllocator;
+
 bitflags! {
     struct TransitionFlags: u32 {
         const RENDER_TARGET = 0x1;
@@ -145,10 +147,19 @@ pub struct TransientResourceLifetime {
 pub struct TransientResource {
     refcount: u32,
     usage: TransitionFlags,
-    lifetime: TransientResourceLifetime,
-    size: u64,
+    pub lifetime: TransientResourceLifetime,
+    pub size: u64,
     alignment: u64,
     name: &'static str
+}
+
+impl ::std::hash::Hash for TransientResource {
+    fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+        self.usage.hash(state);
+        self.lifetime.start.hash(state);
+        self.lifetime.end.hash(state);
+        self.size.hash(state);
+    }
 }
 
 pub struct FrameGraph {
@@ -159,6 +170,7 @@ pub struct FrameGraph {
 
 // (u32, TransitionFlags, Option<usize>, Option<usize>, &'static str)
     resources: Vec<TransientResource>,
+    heaps: HeapMemoryAllocator,
 
     virtual_offset: u32
 }
@@ -210,6 +222,7 @@ impl FrameGraph {
                 renderpasses: Vec::new(),
                 renderpass_transitions: Vec::new(),
                 resources: Vec::new(),
+                heaps: HeapMemoryAllocator::new(),
                 virtual_offset: 0,
             }
         }
@@ -431,16 +444,36 @@ impl FrameGraph {
         let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
         println!("GenBarriers: {}us", sec);
 
+        use std::hash::Hash;
+        use std::hash::Hasher;
+
         let now = Instant::now();
-        use alloc::HeapMemoryAllocator;
-        let bins = HeapMemoryAllocator::with_resources(self.resources.iter().map(|r| (r.size, r.lifetime)).collect::<Vec<_>>());
+        let mut hasher = ::std::collections::hash_map::DefaultHasher::new();
+        for resource in &self.resources { resource.hash(&mut hasher); }
+        let hash = hasher.finish();
+        let elapsed = now.elapsed();
+        let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
+        println!("CalcHash: {}us", sec);
+
+ {
+        let now = Instant::now();
+        let mem = self.heaps.pack_heap(&self.resources);
         let elapsed = now.elapsed();
         let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
         println!("PackHeaps: {}us", sec);
+        println!("HeapMemory: {:?}", mem);
+ }
+        let now = Instant::now();
+        let mem2 = self.heaps.pack_heap(&self.resources);
+        let elapsed = now.elapsed();
+        let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
+        println!("PackHeaps[Cached]: {}us", sec);
 
         //println!("Resources: {:#?}", self.resources);
         //println!("Renderpasses: {:#?}", self.renderpasses);
-        println!("Bins: {:#?}", bins);
+        println!("HeapMemory: {:?}", mem2);
+
+        println!("{}", hash);
     }
 
     pub fn dump(&mut self) {
