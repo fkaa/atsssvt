@@ -3,6 +3,9 @@ use framegraph::{
     TransientResourceLifetime
 };
 
+use winapi::um::d3d12::*;
+use winapi::Interface;
+
 #[derive(Debug, Copy, Clone)]
 pub struct MemoryRegion {
     offset: u64,
@@ -43,6 +46,11 @@ impl HeapBin {
             scanlines: vec![0u64],
             elements: Vec::new()
         }
+    }
+
+    fn clear(&mut self) {
+        self.scanlines.clear();
+        self.elements.clear();
     }
 
     fn occupied(&self, newregion: MemoryRegion) -> bool {
@@ -90,33 +98,171 @@ impl HeapBin {
 #[derive(Debug)]
 pub struct HeapMemoryCacheEntry {
     hash: u64,
-    bins: Vec<HeapBin>,
-    indices: Vec<usize>
+    resources: Vec<(u64, TransientResourceLifetime)>,
+    indices: Vec<(usize, u64)>
 }
 
 impl HeapMemoryCacheEntry {
     pub fn new() -> Self {
         HeapMemoryCacheEntry {
             hash: 0u64,
-            bins: Vec::new(),
+            resources: Vec::new(),
             indices: Vec::new()
         }
     }
-
+/*
     pub fn find_resource(&self, resource: usize) -> &HeapBin {
         &self.bins[self.indices[resource]]
+    }*/
+}
+
+#[derive(Copy, Clone)]
+pub struct Heap {
+    heap: *mut ID3D12Heap,
+    size: u64
+}
+
+pub struct HeapLayout {
+    heaps: Vec<Heap>
+}
+
+impl HeapLayout {
+    fn new() -> Self {
+        HeapLayout {
+            heaps: Vec::new()
+        }
     }
 }
 
 pub struct HeapMemoryAllocator {
+    device: *mut ID3D12Device,
+    current_layout: Vec<Heap>,
     cache: [HeapMemoryCacheEntry; 8],
 }
 
 impl HeapMemoryAllocator {
-    pub fn new() -> Self {
+    pub fn new(device: *mut ID3D12Device) -> Self {
         HeapMemoryAllocator {
+            device: device,
+            current_layout: Vec::new(),
             cache: [HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new()]
         }
+    }
+
+    fn resize(&mut self, resources: &Vec<(u64, TransientResourceLifetime)>) {
+        // TODO: do we even need to sort *all* resources?
+        let mut cached_resources: Vec<(u64, TransientResourceLifetime)> = Vec::new();
+        cached_resources.extend(resources);
+        for entry in self.cache.iter() {
+            if entry.hash != 0 {
+                cached_resources.extend(&entry.resources);
+            }
+        }
+
+        cached_resources.sort_by(|a, b| (b.0).cmp(&a.0));
+
+        let mut layout: Vec<HeapBin> = Vec::new();
+
+        for entry in self.cache.iter_mut() {
+            if entry.hash != 0 {
+
+                entry.indices.resize(entry.resources.len(), (0, 0));
+
+                for bin in &mut layout {
+                    bin.clear();
+                }
+
+                'r: for (idx, resource) in entry.resources.iter().enumerate() {
+                    let mut i = 0;
+                    loop {
+                        if i >= layout.len() {
+                            // TODO: rethink how heap sizes are fetched
+                            layout.push(HeapBin::new(entry.resources[i].0));
+                        }
+
+                        if let Some(offset) = layout[i].insert(resource.1, resource.0) {
+                            entry.indices[idx] = (i, offset);
+                            continue 'r;
+                        }
+
+                        i += 1;
+                    }
+                }
+            }
+        }
+
+        layout.sort_by(|a, b| (b.size).cmp(&a.size));
+
+        // NOTE: take new cache entry:
+        //         * does it fit into the current heap layout?
+        //           * check if all indices' bins are the same size
+        //         * yes?
+        //           * insert into cache
+        //         * no?
+        //           * generate new heap layout from cache entry
+        //             * "merge" with current?
+
+        let mut existing = vec![None; self.current_layout.len()];
+        for (heap_idx, heap) in self.current_layout.iter().enumerate() {
+            for (idx, h) in layout.iter().enumerate() {
+                if h.size == heap.size {
+                    if let Some(i) = existing[heap_idx] {
+                        if idx == i {
+                            continue;
+                        }
+                    } else {
+                        existing[heap_idx] = Some(idx);
+                    }            
+                }
+            }
+        }
+
+        let mut new_heaps = Vec::with_capacity(layout.len());
+        for (idx, heap) in self.current_layout.iter().enumerate() {
+            if existing[idx].is_some() {
+                println!("Carrying Over Heap #{}: {} B", idx, heap.size);
+                new_heaps.push(*heap)
+            } else {
+                println!("Deleting Heap #{}: {} B", idx, heap.size);
+                unsafe { (*heap.heap).Release(); }
+            }
+        }
+
+        for (idx, heap) in layout.iter().enumerate() {
+            if existing.iter().find(|&a| if let &Some(i) = a { i == idx } else { false }).is_some() {
+                continue;
+            }
+
+            let h = unsafe {
+                let mut heap_ptr: *mut ID3D12Heap = ::std::mem::zeroed();
+
+                let desc = D3D12_HEAP_DESC {
+                    SizeInBytes: heap.size,
+                    Properties: D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+                        MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+                        CreationNodeMask: 0,
+                        VisibleNodeMask: 0,
+                    },
+                    Alignment: 0,
+                    Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES
+                };
+
+                println!("Creating Heap #{}: {} B", idx, heap.size);
+                (*self.device).CreateHeap(&desc, &ID3D12Heap::uuidof(), &mut heap_ptr as *mut *mut _ as *mut *mut _);
+
+                heap_ptr
+            };
+
+            new_heaps.push(Heap {
+                heap: h,
+                size: heap.size
+            })
+        }
+
+        /*for heap in self.current_layout {
+        }*/
     }
 
     fn find_entry(&self, hash: u64) -> Option<usize> {
@@ -124,27 +270,15 @@ impl HeapMemoryAllocator {
     }
 
     fn push_entry(&mut self, hash: u64, resources: Vec<(u64, TransientResourceLifetime)>) -> &HeapMemoryCacheEntry {
-        let mut bins = resources.iter().map(|&(sz, _)| HeapBin::new(sz)).collect::<Vec<HeapBin>>();
-        let mut indices = vec![0usize; resources.len()];
-
-        'r: for (idx, resource) in resources.iter().enumerate() {
-            for (bin_idx, bin) in bins.iter_mut().enumerate() {
-                if let Some(_) = bin.insert(resource.1, resource.0) {
-                    indices[idx] = bin_idx;
-                    continue 'r;
-                }
-            }
-        }
-
         for i in 0..7 {
             self.cache.swap(7 - i, 7 - i - 1);
         }
 
-        self.cache[0] = HeapMemoryCacheEntry {
-            hash: hash,
-            bins: bins,
-            indices: indices
-        };
+        self.cache[0].hash = hash;
+        self.cache[0].resources.clear();
+        self.cache[0].resources.extend(&resources);
+
+        self.resize(&resources);
 
         &self.cache[0]
     }
@@ -163,6 +297,7 @@ impl HeapMemoryAllocator {
             let mut resources = resources.iter().map(|r| (r.size, r.lifetime)).collect::<Vec<_>>();
             resources.sort_by(|a, b| (b.0).cmp(&a.0));
 
+            // TODO: resize "main heap" if needed
             self.push_entry(hash, resources)
         }
     }

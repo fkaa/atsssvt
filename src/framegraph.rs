@@ -222,7 +222,7 @@ impl FrameGraph {
                 renderpasses: Vec::new(),
                 renderpass_transitions: Vec::new(),
                 resources: Vec::new(),
-                heaps: HeapMemoryAllocator::new(),
+                heaps: HeapMemoryAllocator::new(device),
                 virtual_offset: 0,
             }
         }
@@ -343,7 +343,7 @@ impl FrameGraph {
     fn generate_barriers(&mut self) {
         // generate all transition barriers
         //
-        // TODO: maybe cull passes before?
+        // TODO: cache all Vec allocations
         //
         let mut current_states = vec![TransitionFlags::empty(); self.resources.len()];
         let mut prev_states = vec![TransitionFlags::empty(); self.resources.len()];
