@@ -9,5 +9,5 @@ term = "0.4.6"
 svg = "*"
 
 [dependencies.winapi]
-git = "https://github.com/retep998/winapi-rs.git"
+version = "0.3"
 features = ["everything"]
