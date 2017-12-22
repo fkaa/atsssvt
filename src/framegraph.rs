@@ -176,55 +176,14 @@ pub struct FrameGraph {
 }
 
 impl FrameGraph {
-    pub fn new() -> Self {
-        unsafe {
-            let mut debug_controller: *mut ID3D12Debug = ptr::null_mut();
-            if SUCCEEDED(D3D12GetDebugInterface(&ID3D12Debug::uuidof(), mem::transmute(&mut debug_controller))) {
-                (*debug_controller).EnableDebugLayer();
-            }
-
-            let mut factory: *mut IDXGIFactory4 = ptr::null_mut();
-            if !SUCCEEDED(CreateDXGIFactory2(DXGI_CREATE_FACTORY_DEBUG, &IDXGIFactory1::uuidof(), mem::transmute(&mut factory))) {
-                panic!();
-            }
-
-            let mut adapter: *mut IDXGIAdapter1 = ptr::null_mut();
-            let mut idx = 0;
-            while (*factory).EnumAdapters1(idx, &mut adapter as _) != DXGI_ERROR_NOT_FOUND {
-                let mut desc: DXGI_ADAPTER_DESC1 = mem::uninitialized();
-                if !SUCCEEDED((*adapter).GetDesc1(&mut desc)) {
-                    idx = idx + 1;
-                    continue;
-                }
-
-                if SUCCEEDED(D3D12CreateDevice(
-                    mem::transmute(adapter),
-
-                    D3D_FEATURE_LEVEL_11_0,
-                    &ID3D12Device::uuidof(),
-                    ptr::null_mut()))
-                {
-                    break;
-                }
-
-                idx = idx + 1;
-            }
-
-            let mut device: *mut ID3D12Device = ptr::null_mut();
-            D3D12CreateDevice(
-                mem::transmute(adapter.as_mut()),
-                D3D_FEATURE_LEVEL_11_0,
-                &ID3D12Device::uuidof(),
-                mem::transmute(&mut device));
-
-            FrameGraph {
-                device,
-                renderpasses: Vec::new(),
-                renderpass_transitions: Vec::new(),
-                resources: Vec::new(),
-                heaps: HeapMemoryAllocator::new(device),
-                virtual_offset: 0,
-            }
+    pub fn new(device: *mut ID3D12Device) -> Self {
+        FrameGraph {
+            device,
+            renderpasses: Vec::new(),
+            renderpass_transitions: Vec::new(),
+            resources: Vec::new(),
+            heaps: HeapMemoryAllocator::new(device),
+            virtual_offset: 0,
         }
     }
 
@@ -461,7 +420,6 @@ impl FrameGraph {
         let elapsed = now.elapsed();
         let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
         println!("PackHeaps: {}us", sec);
-        println!("HeapMemory: {:?}", mem);
  }
         let now = Instant::now();
         let mem2 = self.heaps.pack_heap(&self.resources);
@@ -471,20 +429,22 @@ impl FrameGraph {
 
         //println!("Resources: {:#?}", self.resources);
         //println!("Renderpasses: {:#?}", self.renderpasses);
-        println!("HeapMemory: {:?}", mem2);
-
-        println!("{}", hash);
     }
 
-    pub fn dump(&mut self) {
+    pub fn exec(&mut self, list: *mut ID3D12GraphicsCommandList) {
+        for pass in self.renderpasses.iter() {
+
+        }
+    }
+
+    pub fn finish(&mut self) {
+        self.renderpasses.clear();
+        self.renderpass_transitions.clear();
+        self.resources.clear();
+        self.virtual_offset = 0;
     }
 }
 
-// TODO: each placed resource needs to be created with all usages known
-//       ahead of time (RT, DT) and also be able to transition into proper
-//       states (SRV, RTV, DSV)
-//
-// TODO: heap only requires `HEAP_ALLOW_RT_DS`?
 //#[derive(Debug)]
 pub struct FrameGraphBuilder {
     device: *mut ID3D12Device,

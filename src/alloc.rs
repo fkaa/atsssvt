@@ -193,15 +193,6 @@ impl HeapMemoryAllocator {
 
         layout.sort_by(|a, b| (b.size).cmp(&a.size));
 
-        // NOTE: take new cache entry:
-        //         * does it fit into the current heap layout?
-        //           * check if all indices' bins are the same size
-        //         * yes?
-        //           * insert into cache
-        //         * no?
-        //           * generate new heap layout from cache entry
-        //             * "merge" with current?
-
         let mut existing = vec![None; self.current_layout.len()];
         for (heap_idx, heap) in self.current_layout.iter().enumerate() {
             for (idx, h) in layout.iter().enumerate() {
@@ -240,7 +231,7 @@ impl HeapMemoryAllocator {
                     SizeInBytes: heap.size,
                     Properties: D3D12_HEAP_PROPERTIES {
                         Type: D3D12_HEAP_TYPE_DEFAULT,
-                        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+                        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                         MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
                         CreationNodeMask: 0,
                         VisibleNodeMask: 0,
@@ -260,9 +251,6 @@ impl HeapMemoryAllocator {
                 size: heap.size
             })
         }
-
-        /*for heap in self.current_layout {
-        }*/
     }
 
     fn find_entry(&self, hash: u64) -> Option<usize> {
@@ -297,7 +285,6 @@ impl HeapMemoryAllocator {
             let mut resources = resources.iter().map(|r| (r.size, r.lifetime)).collect::<Vec<_>>();
             resources.sort_by(|a, b| (b.0).cmp(&a.0));
 
-            // TODO: resize "main heap" if needed
             self.push_entry(hash, resources)
         }
     }
