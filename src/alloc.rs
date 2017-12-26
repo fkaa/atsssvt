@@ -6,6 +6,8 @@ use framegraph::{
 use winapi::um::d3d12::*;
 use winapi::Interface;
 
+use std::ptr;
+
 #[derive(Debug, Copy, Clone)]
 pub struct MemoryRegion {
     offset: u64,
@@ -99,6 +101,7 @@ impl HeapBin {
 pub struct HeapMemoryCacheEntry {
     hash: u64,
     resources: Vec<(u64, TransientResourceLifetime)>,
+    // TODO: need to store D3D12_RESOURCE_DESC per resource as well
     indices: Vec<(usize, u64)>
 }
 
@@ -116,7 +119,7 @@ impl HeapMemoryCacheEntry {
     }*/
 }
 
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct Heap {
     heap: *mut ID3D12Heap,
     size: u64
@@ -134,16 +137,59 @@ impl HeapLayout {
     }
 }
 
+#[derive(Debug)]
 pub struct HeapMemoryAllocator {
     device: *mut ID3D12Device,
+
+    cbv_srv_uav_heap: *mut ID3D12DescriptorHeap,
+    srv_stride: u32,
+
+    rtv_dsv_heap: *mut ID3D12DescriptorHeap,
+    rtv_stride: u32,
+
     current_layout: Vec<Heap>,
     cache: [HeapMemoryCacheEntry; 8],
 }
 
 impl HeapMemoryAllocator {
     pub fn new(device: *mut ID3D12Device) -> Self {
+        let (gpu_heap, gpu_stride, cpu_heap, cpu_stride) = unsafe {
+            let mut gpu_heap: *mut ID3D12DescriptorHeap = ptr::null_mut();
+            let mut cpu_heap: *mut ID3D12DescriptorHeap = ptr::null_mut();
+
+            let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+                NumDescriptors: 3000,
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                NodeMask: 0
+            };
+
+            (*device).CreateDescriptorHeap(&desc, &ID3D12DescriptorHeap::uuidof(), &mut gpu_heap as *mut *mut _ as *mut *mut _);
+
+            let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+                NumDescriptors: 3000,
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                NodeMask: 0
+            };
+
+            (*device).CreateDescriptorHeap(&desc, &ID3D12DescriptorHeap::uuidof(), &mut cpu_heap as *mut *mut _ as *mut *mut _);
+
+            let gpu_stride = (*device).GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            let cpu_stride = (*device).GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+            (gpu_heap, gpu_stride, cpu_heap, cpu_stride)
+        };
+
         HeapMemoryAllocator {
             device: device,
+
+            cbv_srv_uav_heap: gpu_heap,
+            srv_stride: gpu_stride,
+
+            rtv_dsv_heap: cpu_heap,
+            rtv_stride: cpu_stride,
+
             current_layout: Vec::new(),
             cache: [HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new()]
         }
@@ -219,6 +265,8 @@ impl HeapMemoryAllocator {
             }
         }
 
+        // TODO: implement resource aliasing, needs to be done after all resources have
+        //       been packed
         for (idx, heap) in layout.iter().enumerate() {
             if existing.iter().find(|&a| if let &Some(i) = a { i == idx } else { false }).is_some() {
                 continue;
@@ -251,6 +299,8 @@ impl HeapMemoryAllocator {
                 size: heap.size
             })
         }
+
+        self.current_layout = new_heaps;
     }
 
     fn find_entry(&self, hash: u64) -> Option<usize> {

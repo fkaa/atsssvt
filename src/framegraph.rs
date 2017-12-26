@@ -36,45 +36,6 @@ impl TransitionFlags {
     }
 }
 
-// TODO: restructure according to dice slides:
-//         [x] renderpass holds array of used resources (and direction?, R/W)
-//         [x] renderpasses is a flat array in framegraph
-//         [x] resources also flat array, referenced by renderpasses
-//         [x] compile time:
-//           [x] iterate over renderpasses:
-//             [x] compute resource ref count
-//             [x] compute first and last user (renderpass)
-//             [x] compute barriers (between renderpasses ?)
-//         [/] culling:
-//           [x] pass.rc += 1 for resource writes
-//           [x] resource.rc += for resource reads
-//           [x] push resources with rc == 0 to stack
-//             [/] while !empty():
-//               [?] pop, resource.producer.rc--
-//               [?] if resource.producer.rc == 0:
-//                 [?] resource.producer.reads.rc--
-//                 [?] if resource.producer.reads.rc == 0
-//                   [?] push to stack
-//
-// TODO: prepare for DX12 implementation:
-//         [ ] move device creation into main
-//         [ ] single large heap
-//         [ ] how to deal with allocation "scheduling"?
-//           * NOTE: large-ish heap with smaller "overflow" heaps?
-//           * NOTE: mostly persistent, allow fragmentation?
-//           * NOTE: manual flag on adding pass?
-//         [/] get physical size of resources
-//           [/] just need to supply the correct D3D12 resource desc
-//         [ ] fix proper creation descriptions 
-//          
-//
-//         NOTE: how to do alloc:
-//                * find all resource size bins
-//                  * find candidate by looking at bins with size >= res.size
-//                  * if lifetimes dont overlap, alias, with some heuristic (
-//                    more bytes saves by aliasing? maybe some rect-fitting
-//                    alg that works)
-//
 #[derive(Debug, Default, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct FrameGraphResource(&'static str, u32);
 
@@ -112,8 +73,12 @@ macro_rules! typed_resource_transition {
     }
 }
 
-physical_resource_bind!(RenderTargetResource => ());
-physical_resource_bind!(ShaderResource => ());
+// TODO: rethink how "resources" (intermediate views passed around) are stored
+//       and later mapped to actual dx12 handles, ideally indexable by
+//       virtual_id
+
+physical_resource_bind!(RenderTargetResource => D3D12_CPU_DESCRIPTOR_HANDLE);
+physical_resource_bind!(ShaderResource => D3D12_GPU_DESCRIPTOR_HANDLE);
 physical_resource_bind!(DepthStencilResource => ());
 physical_resource_bind!(DepthReadResource => ());
 physical_resource_bind!(DepthWriteResource => ());
@@ -143,16 +108,21 @@ pub struct TransientResourceLifetime {
     pub end: u32
 }
 
-#[derive(Debug)]
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct TransientResource {
     refcount: u32,
     usage: TransitionFlags,
     pub lifetime: TransientResourceLifetime,
     pub size: u64,
     alignment: u64,
+    #[derivative(Debug="ignore")]
+    desc: D3D12_RESOURCE_DESC,
     name: &'static str
 }
 
+// TODO: if we want to cache placed resources & views need to hash the resource
+//       description as well
 impl ::std::hash::Hash for TransientResource {
     fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
         self.usage.hash(state);
@@ -165,10 +135,11 @@ impl ::std::hash::Hash for TransientResource {
 pub struct FrameGraph {
     device: *mut ID3D12Device,
 
+    // TODO: renderpass contents should borrow from heap allocator (cache)
     renderpasses: Vec<RenderPass>,
+    // transitions too? at least aliasing
     renderpass_transitions: Vec<Vec<ResourceTransition>>,
 
-// (u32, TransitionFlags, Option<usize>, Option<usize>, &'static str)
     resources: Vec<TransientResource>,
     heaps: HeapMemoryAllocator,
 
@@ -213,6 +184,7 @@ impl FrameGraph {
                 lifetime: TransientResourceLifetime { start: 0, end: 0 },
                 size: size as _,
                 alignment: alignment as _,
+                desc: desc,
                 name: n
             }
         }));
@@ -427,8 +399,6 @@ impl FrameGraph {
         let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
         println!("PackHeaps[Cached]: {}us", sec);
 
-        //println!("Resources: {:#?}", self.resources);
-        //println!("Renderpasses: {:#?}", self.renderpasses);
     }
 
     pub fn exec(&mut self, list: *mut ID3D12GraphicsCommandList) {

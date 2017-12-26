@@ -3,6 +3,8 @@
 
 extern crate winapi;
 extern crate term;
+#[macro_use]
+extern crate derivative;
 extern crate svg;
 
 #[macro_use]
@@ -291,7 +293,7 @@ fn main() {
             (*queue).Signal(fence, old_value);
             fence_value += 1;
 
-            if ((*fence).GetCompletedValue() < old_value) {
+            if (*fence).GetCompletedValue() < old_value {
                 (*fence).SetEventOnCompletion(old_value, fence_event);
                 WaitForSingleObject(fence_event, INFINITE);
             }
