@@ -97,11 +97,24 @@ impl HeapBin {
     }
 }
 
-#[derive(Debug)]
+/*#[repr(C)]
+union DescriptorHandle {
+    gpu: D3D12_GPU_DESCRIPTOR_HANDLE,
+    cpu: D3D12_CPU_DESCRIPTOR_HANDLE,
+}*/
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct HeapMemoryCacheEntry {
     hash: u64,
-    resources: Vec<(u64, TransientResourceLifetime)>,
+    #[derivative(Debug="ignore")]
+    resources: Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC)>,
     // TODO: need to store D3D12_RESOURCE_DESC per resource as well
+
+    placed_resources: Vec<*mut ID3D12Resource>,
+    #[derivative(Debug="ignore")]
+    gpu_handles: Vec<D3D12_GPU_DESCRIPTOR_HANDLE>,
+    #[derivative(Debug="ignore")]
+    cpu_handles: Vec<D3D12_CPU_DESCRIPTOR_HANDLE>,
     indices: Vec<(usize, u64)>
 }
 
@@ -110,8 +123,19 @@ impl HeapMemoryCacheEntry {
         HeapMemoryCacheEntry {
             hash: 0u64,
             resources: Vec::new(),
+            placed_resources: Vec::new(),
+            gpu_handles: Vec::new(),
+            cpu_handles: Vec::new(),
             indices: Vec::new()
         }
+    }
+
+    pub fn get_cpu_handle(&self, id: usize) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        self.cpu_handles[id]
+    }
+
+    pub fn get_gpu_handle(&self, id: usize) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        self.gpu_handles[id]
     }
 /*
     pub fn find_resource(&self, resource: usize) -> &HeapBin {
@@ -136,6 +160,8 @@ impl HeapLayout {
         }
     }
 }
+
+// TODO: linear array of 0..virtual_id for both created & views?
 
 #[derive(Debug)]
 pub struct HeapMemoryAllocator {
@@ -195,9 +221,9 @@ impl HeapMemoryAllocator {
         }
     }
 
-    fn resize(&mut self, resources: &Vec<(u64, TransientResourceLifetime)>) {
+    fn resize(&mut self, resources: &Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC)>) {
         // TODO: do we even need to sort *all* resources?
-        let mut cached_resources: Vec<(u64, TransientResourceLifetime)> = Vec::new();
+        let mut cached_resources: Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC)> = Vec::new();
         cached_resources.extend(resources);
         for entry in self.cache.iter() {
             if entry.hash != 0 {
@@ -300,6 +326,20 @@ impl HeapMemoryAllocator {
             })
         }
 
+        for entry in self.cache.iter_mut() {
+            if entry.hash != 0 {
+                for (idx, &(heap, offset)) in entry.indices.iter().enumerate() {
+                    let mut resource: *mut ID3D12Resource = ptr::null_mut();
+                    unsafe {
+                        (*self.device).CreatePlacedResource(new_heaps[heap].heap, offset, &entry.resources[idx].2, D3D12_RESOURCE_STATE_RENDER_TARGET, ptr::null_mut(), &ID3D12Resource::uuidof(), &mut resource as *mut *mut _ as *mut *mut _);
+                    }
+
+                    // TODO: probably should be in some order?
+                    entry.placed_resources.push(resource);
+                }
+            }
+        }
+
         self.current_layout = new_heaps;
     }
 
@@ -307,7 +347,7 @@ impl HeapMemoryAllocator {
         self.cache.iter().position(|entry| entry.hash == hash)
     }
 
-    fn push_entry(&mut self, hash: u64, resources: Vec<(u64, TransientResourceLifetime)>) -> &HeapMemoryCacheEntry {
+    fn push_entry(&mut self, hash: u64, resources: Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC)>) -> &HeapMemoryCacheEntry {
         for i in 0..7 {
             self.cache.swap(7 - i, 7 - i - 1);
         }
@@ -332,7 +372,7 @@ impl HeapMemoryAllocator {
         if let Some(entry) = self.find_entry(hash) {
             &self.cache[entry]
         } else {
-            let mut resources = resources.iter().map(|r| (r.size, r.lifetime)).collect::<Vec<_>>();
+            let mut resources = resources.iter().map(|r| (r.size, r.lifetime, r.desc)).collect::<Vec<_>>();
             resources.sort_by(|a, b| (b.0).cmp(&a.0));
 
             self.push_entry(hash, resources)

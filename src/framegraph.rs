@@ -1,19 +1,7 @@
 use winapi::um::d3d12::*;
-use winapi::um::d3d12sdklayers::*;
-use winapi::um::d3dcommon::*;
 
-use winapi::shared::winerror::*;
 use winapi::shared::dxgiformat::*;
 use winapi::shared::dxgitype::*;
-use winapi::shared::dxgi::*;
-//use winapi::shared::dxgi1_2::*;
-use winapi::shared::dxgi1_3::*;
-use winapi::shared::dxgi1_4::*;
-
-use winapi::Interface;
-
-use std::ptr;
-use std::mem;
 
 use alloc::HeapMemoryAllocator;
 
@@ -34,10 +22,28 @@ impl TransitionFlags {
     fn has_write(self) -> bool {
         self.intersects(TransitionFlags::RENDER_TARGET | TransitionFlags::DEPTH_WRITE)
     }
+
+    fn into_resource_flags(self) -> D3D12_RESOURCE_FLAGS {
+        let mut out = D3D12_RESOURCE_FLAG_NONE;
+
+        if self.contains(TransitionFlags::RENDER_TARGET) {
+            out |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        }
+
+        if self.contains(TransitionFlags::DEPTH_WRITE) {
+            out |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        }
+
+        out
+    }
 }
 
 #[derive(Debug, Default, Copy, Clone, Hash, PartialEq, Eq)]
-pub struct FrameGraphResource(&'static str, u32);
+pub struct FrameGraphResource {
+    name: &'static str,
+    view_id: u32,
+    resource_id: u32
+}
 
 pub trait ResourceBinding {
     type PhysicalResource;
@@ -73,9 +79,13 @@ macro_rules! typed_resource_transition {
     }
 }
 
-// TODO: rethink how "resources" (intermediate views passed around) are stored
-//       and later mapped to actual dx12 handles, ideally indexable by
-//       virtual_id
+impl ResourceBinding for () {
+    type PhysicalResource = ();
+
+    fn get_virtual_resource(&self) -> FrameGraphResource {
+        unimplemented!()
+    }
+}
 
 physical_resource_bind!(RenderTargetResource => D3D12_CPU_DESCRIPTOR_HANDLE);
 physical_resource_bind!(ShaderResource => D3D12_GPU_DESCRIPTOR_HANDLE);
@@ -117,12 +127,10 @@ pub struct TransientResource {
     pub size: u64,
     alignment: u64,
     #[derivative(Debug="ignore")]
-    desc: D3D12_RESOURCE_DESC,
+    pub desc: D3D12_RESOURCE_DESC,
     name: &'static str
 }
 
-// TODO: if we want to cache placed resources & views need to hash the resource
-//       description as well
 impl ::std::hash::Hash for TransientResource {
     fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
         self.usage.hash(state);
@@ -143,7 +151,8 @@ pub struct FrameGraph {
     resources: Vec<TransientResource>,
     heaps: HeapMemoryAllocator,
 
-    virtual_offset: u32
+    virtual_offset: u32,
+    virtual_view: u32
 }
 
 impl FrameGraph {
@@ -155,19 +164,21 @@ impl FrameGraph {
             resources: Vec::new(),
             heaps: HeapMemoryAllocator::new(device),
             virtual_offset: 0,
+            virtual_view: 0,
         }
     }
 
     pub fn add_pass<T, Init, Exec>(&mut self, name: &'static str, init: Init, exec: Exec) -> T
-        where T: Sized /*+ Copy + Clone */,
+        where T: ResourceBinding + Sized /*+ Copy + Clone */,
               Init: FnOnce(&mut FrameGraphBuilder) -> T,
-              Exec: FnMut(T)
+              Exec: FnMut(T::PhysicalResource)
     {
-        let mut builder = FrameGraphBuilder::new(self.device, self.virtual_offset);
+        let mut builder = FrameGraphBuilder::new(self.device, self.virtual_offset, self.virtual_view);
 
         let output = init(&mut builder);
 
         self.virtual_offset = builder.counter;
+        self.virtual_view = builder.view_counter;
 
         let device = self.device;
 
@@ -280,6 +291,7 @@ impl FrameGraph {
         let mut prev_states = vec![TransitionFlags::empty(); self.resources.len()];
         let mut cache_passes = vec![None; self.resources.len()];
         let mut prev_passes = vec![0usize; self.resources.len()];
+        let mut aggregate_state = vec![TransitionFlags::empty(); self.resources.len()];
 
         self.renderpass_transitions.resize(self.renderpasses.len(), Vec::new());
 
@@ -289,6 +301,8 @@ impl FrameGraph {
 
                 let transition = resource.1;
                 let prev_transition = prev_states[idx];
+
+                aggregate_state[idx].insert(transition);
 
                 if transition.has_write() {
                     if current_states[idx].has_read() {
@@ -336,7 +350,6 @@ impl FrameGraph {
             }
         }
 
-
         for i in 0..self.resources.len() {
             let prev_state = prev_states[i];
             let current_state = current_states[i];
@@ -350,6 +363,10 @@ impl FrameGraph {
                     });
                 }
             }
+        }
+
+        for (idx, resource) in self.resources.iter_mut().enumerate() {
+            resource.desc.Flags = aggregate_state[idx].into_resource_flags();
         }
     }
 
@@ -403,7 +420,7 @@ impl FrameGraph {
 
     pub fn exec(&mut self, list: *mut ID3D12GraphicsCommandList) {
         for pass in self.renderpasses.iter() {
-
+            
         }
     }
 
@@ -421,22 +438,28 @@ pub struct FrameGraphBuilder {
     created: Vec<(&'static str, u32, TransitionFlags, D3D12_RESOURCE_DESC)>,
     resources: Vec<(u32, TransitionFlags)>,
     counter: u32,
+    view_counter: u32,
 }
 
 impl FrameGraphBuilder {
-    fn new(device: *mut ID3D12Device, offset: u32) -> Self {
+    fn new(device: *mut ID3D12Device, offset: u32, view_offset: u32) -> Self {
         FrameGraphBuilder {
             device: device,
             created: Vec::new(),
             resources: Vec::new(),
-            counter: offset
+            counter: offset,
+            view_counter: view_offset
         }
     }
 
     pub fn create_render_target(&mut self, name: &'static str, desc: RenderTargetDesc) -> RenderTargetResource {
         let virtual_id = self.counter;
         self.counter += 1;
-        let res = FrameGraphResource(name, virtual_id);
+        let res = FrameGraphResource {
+            name: name,
+            view_id: 0,
+            resource_id: virtual_id
+        };
 
         let resource_desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
@@ -463,7 +486,11 @@ impl FrameGraphBuilder {
     pub fn create_depth(&mut self, name: &'static str, desc: DepthDesc) -> DepthWriteResource {
         let virtual_id = self.counter;
         self.counter += 1;
-        let res = FrameGraphResource(name, virtual_id);
+        let res = FrameGraphResource {
+            name: name,
+            view_id: 0,
+            resource_id: virtual_id
+        };
 
         let resource_desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
@@ -500,18 +527,15 @@ impl FrameGraphBuilder {
     }
 
     fn read(&mut self, resource: FrameGraphResource, transition: TransitionFlags) -> FrameGraphResource {
-        self.resources.push((resource.1, transition));
+        self.resources.push((resource.resource_id, transition));
         resource
     }
 
     fn write(&mut self, resource: FrameGraphResource, transition: TransitionFlags) -> FrameGraphResource {
-        self.resources.push((resource.1, transition));
+        self.resources.push((resource.resource_id, transition));
         resource
     }
 }
-
-
-
 
 #[derive(Debug, Copy, Clone)]
 pub enum TextureSize {
