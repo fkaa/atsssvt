@@ -49,6 +49,9 @@ pub trait ResourceBinding {
     type PhysicalResource;
 
     fn get_virtual_resource(&self) -> FrameGraphResource;
+    fn get_virtual_resources(&self) -> Box<[FrameGraphResource]> {
+        Box::new([self.get_virtual_resource()])
+    }
 }
 
 pub trait IntoTypedResource<T> {
@@ -99,9 +102,13 @@ typed_resource_transition!(DepthWriteResource => ShaderResource);
 typed_resource_transition!(DepthWriteResource => DepthReadResource);
 typed_resource_transition!(DepthReadResource => DepthWriteResource);
 
-#[derive(Debug)]
+#[derive(Derivative)]
+#[derivative(Debug)]
 struct RenderPass {
     resources: Vec<(u32, TransitionFlags)>,
+    #[derivative(Debug="ignore")]
+    exec: Box<FnMut(*mut ID3D12GraphicsCommandList, &())>,
+    params: Vec<u32>,
     refcount: u32
 }
 
@@ -168,10 +175,9 @@ impl FrameGraph {
         }
     }
 
-    pub fn add_pass<T, Init, Exec>(&mut self, name: &'static str, init: Init, exec: Exec) -> T
+    pub fn add_pass<T, Init>(&mut self, name: &'static str, init: Init, exec: Box<FnMut(*mut ID3D12GraphicsCommandList, &T::PhysicalResource)>) -> T
         where T: ResourceBinding + Sized /*+ Copy + Clone */,
               Init: FnOnce(&mut FrameGraphBuilder) -> T,
-              Exec: FnMut(T::PhysicalResource)
     {
         let mut builder = FrameGraphBuilder::new(self.device, self.virtual_offset, self.virtual_view);
 
@@ -200,8 +206,12 @@ impl FrameGraph {
             }
         }));
 
+        let exec = unsafe { ::std::mem::transmute(exec) };
+
         self.renderpasses.push((RenderPass {
             resources: builder.resources,
+            exec: exec,
+            params: output.get_virtual_resources().iter().map(|r| r.view_id).collect(),
             refcount: 0
         }));
 

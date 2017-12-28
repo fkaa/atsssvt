@@ -231,9 +231,9 @@ fn main() {
 
                     builder.create_render_target("Color", desc)
                 },
-                |_| {
+                Box::new(|_list, _| {
 
-                }
+                })
             );
 
             let _ = fg.add_pass(
@@ -242,9 +242,9 @@ fn main() {
                     builder.read_srv(&color);
                     ()
                 },
-                |_| {
+                Box::new(|_list, _| {
 
-                }
+                })
             );
 
             let color = fg.add_pass(
@@ -259,9 +259,9 @@ fn main() {
 
                     builder.create_render_target("ColorAlias", desc)
                 },
-                |_| {
+                Box::new(|_list, _| {
 
-                }
+                })
             );
 
             let _ = fg.add_pass(
@@ -270,9 +270,9 @@ fn main() {
                     builder.read_srv(&color);
                     ()
                 },
-                |_| {
+                Box::new(|_list, _| {
 
-                }
+                })
             );
 
             fg.compile();
