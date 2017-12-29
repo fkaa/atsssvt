@@ -3,7 +3,10 @@ use winapi::um::d3d12::*;
 use winapi::shared::dxgiformat::*;
 use winapi::shared::dxgitype::*;
 
-use alloc::HeapMemoryAllocator;
+use alloc::{
+    HeapMemoryAllocator,
+    HeapMemoryCacheEntry
+};
 
 bitflags! {
     struct TransitionFlags: u32 {
@@ -52,6 +55,12 @@ pub trait ResourceBinding {
     fn get_virtual_resources(&self) -> Box<[FrameGraphResource]> {
         Box::new([self.get_virtual_resource()])
     }
+
+    // TODO: TEMP
+    fn is_cpu(&self) -> bool;
+    fn is_cpus(&self) -> Box<[bool]> {
+        Box::new([self.is_cpu()])
+    }
 }
 
 pub trait IntoTypedResource<T> {
@@ -59,17 +68,36 @@ pub trait IntoTypedResource<T> {
 }
 
 macro_rules! physical_resource_bind {
-    ($name:ident => $physical:ty) => {
+    ($name:ident => CPU) => {
         pub struct $name(FrameGraphResource);
 
         impl ResourceBinding for $name {
-            type PhysicalResource = $physical;
+            type PhysicalResource = D3D12_CPU_DESCRIPTOR_HANDLE;
 
             fn get_virtual_resource(&self) -> FrameGraphResource {
                 self.0
             }
+
+            fn is_cpu(&self) -> bool {
+                true
+            }
         }
-    }
+    };
+    ($name:ident => GPU) => {
+        pub struct $name(FrameGraphResource);
+
+        impl ResourceBinding for $name {
+            type PhysicalResource = D3D12_GPU_DESCRIPTOR_HANDLE;
+
+            fn get_virtual_resource(&self) -> FrameGraphResource {
+                self.0
+            }
+
+            fn is_cpu(&self) -> bool {
+                false
+            }
+        }
+    };
 }
 
 macro_rules! typed_resource_transition {
@@ -88,13 +116,17 @@ impl ResourceBinding for () {
     fn get_virtual_resource(&self) -> FrameGraphResource {
         unimplemented!()
     }
+
+    fn is_cpu(&self) -> bool {
+        unimplemented!()
+    }
 }
 
-physical_resource_bind!(RenderTargetResource => D3D12_CPU_DESCRIPTOR_HANDLE);
-physical_resource_bind!(ShaderResource => D3D12_GPU_DESCRIPTOR_HANDLE);
-physical_resource_bind!(DepthStencilResource => ());
-physical_resource_bind!(DepthReadResource => ());
-physical_resource_bind!(DepthWriteResource => ());
+physical_resource_bind!(RenderTargetResource => CPU);
+physical_resource_bind!(DepthStencilResource => CPU);
+physical_resource_bind!(ShaderResource => GPU);
+physical_resource_bind!(DepthReadResource => CPU);
+physical_resource_bind!(DepthWriteResource => CPU);
 
 typed_resource_transition!(RenderTargetResource => ShaderResource);
 typed_resource_transition!(DepthReadResource => ShaderResource);
@@ -107,8 +139,11 @@ typed_resource_transition!(DepthReadResource => DepthWriteResource);
 struct RenderPass {
     resources: Vec<(u32, TransitionFlags)>,
     #[derivative(Debug="ignore")]
+    views: Vec<ResourceView>,
+    #[derivative(Debug="ignore")]
     exec: Box<FnMut(*mut ID3D12GraphicsCommandList, &())>,
-    params: Vec<u32>,
+    param_size: usize,
+    params: Vec<(bool, u32)>,
     refcount: u32
 }
 
@@ -129,6 +164,7 @@ pub struct TransientResourceLifetime {
 #[derivative(Debug)]
 pub struct TransientResource {
     refcount: u32,
+    resource_id: u32,
     usage: TransitionFlags,
     pub lifetime: TransientResourceLifetime,
     pub size: u64,
@@ -156,6 +192,7 @@ pub struct FrameGraph {
     renderpass_transitions: Vec<Vec<ResourceTransition>>,
 
     resources: Vec<TransientResource>,
+    views: Vec<ResourceView>,
     heaps: HeapMemoryAllocator,
 
     virtual_offset: u32,
@@ -169,6 +206,7 @@ impl FrameGraph {
             renderpasses: Vec::new(),
             renderpass_transitions: Vec::new(),
             resources: Vec::new(),
+            views: Vec::new(),
             heaps: HeapMemoryAllocator::new(device),
             virtual_offset: 0,
             virtual_view: 0,
@@ -188,30 +226,35 @@ impl FrameGraph {
 
         let device = self.device;
 
-        self.resources.extend(builder.created.into_iter().map(|(n,a,b,desc)| {
+        self.resources.extend(builder.created.into_iter().map(|resource| {
             let (size, alignment) = unsafe {
-                let alloc_info = (*device).GetResourceAllocationInfo(0, 1, &desc as *const _);
+                let alloc_info = (*device).GetResourceAllocationInfo(0, 1, &resource.desc as *const _);
 
                 (alloc_info.SizeInBytes, alloc_info.Alignment)
             };
 
             TransientResource {
                 refcount: 0,
-                usage: b,
+                resource_id: resource.resource_id,
+                usage: resource.flags,
                 lifetime: TransientResourceLifetime { start: 0, end: 0 },
                 size: size as _,
                 alignment: alignment as _,
-                desc: desc,
-                name: n
+                desc: resource.desc,
+                name: resource.name
             }
         }));
+
+        self.views.extend(builder.views.clone());
 
         let exec = unsafe { ::std::mem::transmute(exec) };
 
         self.renderpasses.push((RenderPass {
             resources: builder.resources,
+            views: builder.views,
             exec: exec,
-            params: output.get_virtual_resources().iter().map(|r| r.view_id).collect(),
+            params: output.get_virtual_resources().iter().zip(output.is_cpus().iter()).map(|(r, &b)| (b, r.view_id)).collect(),
+            param_size: output.is_cpus().iter().fold(0usize, |sum, &b| if b { ::std::mem::size_of::<D3D12_CPU_DESCRIPTOR_HANDLE>() } else { ::std::mem::size_of::<D3D12_GPU_DESCRIPTOR_HANDLE>() }),
             refcount: 0
         }));
 
@@ -402,35 +445,41 @@ impl FrameGraph {
         let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
         println!("GenBarriers: {}us", sec);
 
-        use std::hash::Hash;
-        use std::hash::Hasher;
-
         let now = Instant::now();
-        let mut hasher = ::std::collections::hash_map::DefaultHasher::new();
-        for resource in &self.resources { resource.hash(&mut hasher); }
-        let hash = hasher.finish();
-        let elapsed = now.elapsed();
-        let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
-        println!("CalcHash: {}us", sec);
-
- {
-        let now = Instant::now();
-        let mem = self.heaps.pack_heap(&self.resources);
+        let mem = self.heaps.pack_heap(&self.resources, &self.views);
         let elapsed = now.elapsed();
         let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
         println!("PackHeaps: {}us", sec);
- }
-        let now = Instant::now();
-        let mem2 = self.heaps.pack_heap(&self.resources);
-        let elapsed = now.elapsed();
-        let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
-        println!("PackHeaps[Cached]: {}us", sec);
-
     }
 
     pub fn exec(&mut self, list: *mut ID3D12GraphicsCommandList) {
-        for pass in self.renderpasses.iter() {
-            
+        let entry = self.heaps.current();
+
+        for pass in self.renderpasses.iter_mut() {
+            let mut data = vec![0xfeu8; pass.param_size];
+            let mut cur = 0;
+
+            unsafe {
+                for &(b, id) in &pass.params {
+                    let sz = if b {
+                        let handle: *const u8 = ::std::mem::transmute(&self.heaps.get_cpu_handle(id as usize));
+                        let sz = ::std::mem::size_of::<D3D12_CPU_DESCRIPTOR_HANDLE>();
+                        ::std::ptr::copy(handle, data[cur..].as_mut_ptr(), sz);
+
+                        sz
+                    } else {
+                        let handle: *const u8 = ::std::mem::transmute(&self.heaps.get_gpu_handle(id as u64));
+                        let sz = ::std::mem::size_of::<D3D12_GPU_DESCRIPTOR_HANDLE>();
+                        ::std::ptr::copy(handle, data[cur..].as_mut_ptr(), sz);
+
+                        sz
+                    };
+
+                    cur += sz;
+                }
+            }
+
+            (pass.exec)(list, unsafe { ::std::mem::transmute(data.as_ptr()) })
         }
     }
 
@@ -438,15 +487,42 @@ impl FrameGraph {
         self.renderpasses.clear();
         self.renderpass_transitions.clear();
         self.resources.clear();
+        self.views.clear();
         self.virtual_offset = 0;
+        self.virtual_view = 0;
     }
+}
+
+
+// created: Vec<(&'static str, u32, TransitionFlags, D3D12_RESOURCE_DESC)>,
+//#[derive(Debug)]
+pub struct PlacedResource {
+    name: &'static str,
+    resource_id: u32,
+    flags: TransitionFlags,
+    desc: D3D12_RESOURCE_DESC,
+}
+
+#[derive(Clone)]
+pub enum ResourceViewDesc {
+    RenderTarget(D3D12_RENDER_TARGET_VIEW_DESC),
+    ShaderResource(D3D12_SHADER_RESOURCE_VIEW_DESC),
+}
+
+//#[derive(Debug)]
+#[derive(Clone)]
+pub struct ResourceView {
+    pub resource_id: u32,
+    pub view_id: u32,
+    pub desc: ResourceViewDesc
 }
 
 //#[derive(Debug)]
 pub struct FrameGraphBuilder {
     device: *mut ID3D12Device,
-    created: Vec<(&'static str, u32, TransitionFlags, D3D12_RESOURCE_DESC)>,
+    created: Vec<PlacedResource>,
     resources: Vec<(u32, TransitionFlags)>,
+    views: Vec<ResourceView>,
     counter: u32,
     view_counter: u32,
 }
@@ -457,6 +533,7 @@ impl FrameGraphBuilder {
             device: device,
             created: Vec::new(),
             resources: Vec::new(),
+            views: Vec::new(),
             counter: offset,
             view_counter: view_offset
         }
@@ -487,7 +564,30 @@ impl FrameGraphBuilder {
             Flags: D3D12_RESOURCE_FLAG_NONE,
         };
 
-        self.created.push((name, virtual_id, TransitionFlags::RENDER_TARGET, resource_desc));
+        let mut view_desc: D3D12_RENDER_TARGET_VIEW_DESC = unsafe { ::std::mem::zeroed() };
+        view_desc.Format = desc.format.into();
+        view_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        unsafe {
+            (*view_desc.u.Texture2D_mut()) = D3D12_TEX2D_RTV {
+                MipSlice: 0,
+                PlaneSlice: 0
+            };
+        }
+
+        self.views.push(ResourceView {
+            resource_id: virtual_id,
+            view_id: self.view_counter,
+            desc: ResourceViewDesc::RenderTarget(view_desc)
+        });
+
+        self.view_counter += 1;
+
+        self.created.push(PlacedResource {
+            resource_id: virtual_id,
+            flags: TransitionFlags::RENDER_TARGET,
+            desc: resource_desc,
+            name: name
+        });
         self.write(res, TransitionFlags::RENDER_TARGET);
 
         RenderTargetResource(res)
@@ -518,7 +618,12 @@ impl FrameGraphBuilder {
             Flags: D3D12_RESOURCE_FLAG_NONE,
         };
 
-        self.created.push((name, virtual_id, TransitionFlags::DEPTH_WRITE, resource_desc));
+        self.created.push(PlacedResource {
+            resource_id: virtual_id,
+            flags: TransitionFlags::DEPTH_WRITE,
+            desc: resource_desc,
+            name: name
+        });
         self.write(res, TransitionFlags::DEPTH_WRITE);
 
         DepthWriteResource(res)

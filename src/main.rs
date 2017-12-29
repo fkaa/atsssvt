@@ -175,19 +175,23 @@ fn main() {
         (device, queue, hwnd, swapchain)
     };
 
+    println!("{:?}, {:?}, {:?}, {:?}", device, queue, hwnd, swapchain);
+
     let (allocator, list) = unsafe {
         let mut allocator: *mut ID3D12CommandAllocator = ptr::null_mut();
         (*device).CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, &ID3D12CommandAllocator::uuidof(), &mut allocator as *mut *mut _ as *mut *mut _);
 
         let mut list: *mut ID3D12GraphicsCommandList = ptr::null_mut();
-        (*device).CreateCommandList(
+        let hr = (*device).CreateCommandList(
             0,
             D3D12_COMMAND_LIST_TYPE_DIRECT,
             allocator,
             ptr::null_mut(),
-            &ID3D12CommandList::uuidof(),
+            &ID3D12GraphicsCommandList::uuidof(),
             &mut list as *mut *mut _ as *mut *mut _
         );
+        println!("{:?}   {:?}, {:?}", hr, allocator, list);
+
         (*list).Close();
 
         (allocator, list)
@@ -231,16 +235,19 @@ fn main() {
 
                     builder.create_render_target("Color", desc)
                 },
-                Box::new(|_list, _| {
+                Box::new(|list, color_rtv: &D3D12_CPU_DESCRIPTOR_HANDLE| {
+                    println!("Inside exec closure! {:#x}", color_rtv.ptr);
 
+                    unsafe {
+                        (*list).ClearRenderTargetView(*color_rtv, &[0.8f32, 0.4f32, 0.3f32, 1f32], 0, ::std::ptr::null_mut());
+                    }
                 })
             );
 
             let _ = fg.add_pass(
                 "Dummy",
                 |builder| {
-                    builder.read_srv(&color);
-                    ()
+                    builder.read_srv(&color)
                 },
                 Box::new(|_list, _| {
 
@@ -267,8 +274,7 @@ fn main() {
             let _ = fg.add_pass(
                 "DummyAlias",
                 |builder| {
-                    builder.read_srv(&color);
-                    ()
+                    builder.read_srv(&color)
                 },
                 Box::new(|_list, _| {
 

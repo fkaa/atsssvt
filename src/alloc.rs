@@ -1,4 +1,6 @@
 use framegraph::{
+    ResourceView,
+    ResourceViewDesc,
     TransientResource,
     TransientResourceLifetime
 };
@@ -97,18 +99,14 @@ impl HeapBin {
     }
 }
 
-/*#[repr(C)]
-union DescriptorHandle {
-    gpu: D3D12_GPU_DESCRIPTOR_HANDLE,
-    cpu: D3D12_CPU_DESCRIPTOR_HANDLE,
-}*/
 #[derive(Derivative)]
 #[derivative(Debug)]
 pub struct HeapMemoryCacheEntry {
     hash: u64,
     #[derivative(Debug="ignore")]
     resources: Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC)>,
-    // TODO: need to store D3D12_RESOURCE_DESC per resource as well
+    #[derivative(Debug="ignore")]
+    views: Vec<ResourceView>,
 
     placed_resources: Vec<*mut ID3D12Resource>,
     #[derivative(Debug="ignore")]
@@ -123,6 +121,7 @@ impl HeapMemoryCacheEntry {
         HeapMemoryCacheEntry {
             hash: 0u64,
             resources: Vec::new(),
+            views: Vec::new(),
             placed_resources: Vec::new(),
             gpu_handles: Vec::new(),
             cpu_handles: Vec::new(),
@@ -219,6 +218,24 @@ impl HeapMemoryAllocator {
             current_layout: Vec::new(),
             cache: [HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new(),HeapMemoryCacheEntry::new()]
         }
+    }
+
+    pub fn get_cpu_handle(&self, id: usize) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let mut handle = unsafe { (*self.rtv_dsv_heap).GetCPUDescriptorHandleForHeapStart() };
+        handle.ptr += id * self.rtv_stride as usize;
+
+        handle
+    }
+
+    pub fn get_gpu_handle(&self, id: u64) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        let mut handle = unsafe { (*self.cbv_srv_uav_heap).GetGPUDescriptorHandleForHeapStart() };
+        handle.ptr += id * self.srv_stride as u64;
+
+        handle
+    }
+
+    pub fn current(&self) -> &HeapMemoryCacheEntry {
+        &self.cache[0]
     }
 
     fn resize(&mut self, resources: &Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC)>) {
@@ -347,21 +364,40 @@ impl HeapMemoryAllocator {
         self.cache.iter().position(|entry| entry.hash == hash)
     }
 
-    fn push_entry(&mut self, hash: u64, resources: Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC)>) -> &HeapMemoryCacheEntry {
+    fn push_entry(&mut self, hash: u64, resources: Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC)>, views: &Vec<ResourceView>) -> &HeapMemoryCacheEntry {
         for i in 0..7 {
             self.cache.swap(7 - i, 7 - i - 1);
         }
 
-        self.cache[0].hash = hash;
-        self.cache[0].resources.clear();
-        self.cache[0].resources.extend(&resources);
+        {
+            self.cache[0].hash = hash;
+            self.cache[0].resources.clear();
+            self.cache[0].resources.extend(&resources);
 
-        self.resize(&resources);
+            self.resize(&resources);
+
+            for view in views {
+                let resource = self.cache[0].placed_resources[view.resource_id as usize];
+
+                match view.desc {
+                    ResourceViewDesc::RenderTarget(desc) => {
+                        let handle = self.get_cpu_handle(view.view_id as usize);
+
+                        unsafe {
+                            (*self.device).CreateRenderTargetView(resource, &desc, handle);
+                        }
+                    },
+                    ResourceViewDesc::ShaderResource(desc) => {
+
+                    }
+                }
+            }
+        }
 
         &self.cache[0]
     }
 
-    pub fn pack_heap(&mut self, resources: &Vec<TransientResource>) -> &HeapMemoryCacheEntry {
+    pub fn pack_heap(&mut self, resources: &Vec<TransientResource>, views: &Vec<ResourceView>) -> &HeapMemoryCacheEntry {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
@@ -375,7 +411,7 @@ impl HeapMemoryAllocator {
             let mut resources = resources.iter().map(|r| (r.size, r.lifetime, r.desc)).collect::<Vec<_>>();
             resources.sort_by(|a, b| (b.0).cmp(&a.0));
 
-            self.push_entry(hash, resources)
+            self.push_entry(hash, resources, views)
         }
     }
 
