@@ -238,6 +238,10 @@ impl HeapMemoryAllocator {
         &self.cache[0]
     }
 
+    pub fn get_placed_resource_ptr(&self, idx: usize) -> *mut ID3D12Resource {
+        self.current().placed_resources[idx]
+    }
+
     fn resize(&mut self, resources: &Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC)>) {
         // TODO: do we even need to sort *all* resources?
         let mut cached_resources: Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC)> = Vec::new();
@@ -342,6 +346,8 @@ impl HeapMemoryAllocator {
                 size: heap.size
             })
         }
+
+        // TODO: clear previous placed resources
 
         for entry in self.cache.iter_mut() {
             if entry.hash != 0 {

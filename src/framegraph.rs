@@ -26,6 +26,28 @@ impl TransitionFlags {
         self.intersects(TransitionFlags::RENDER_TARGET | TransitionFlags::DEPTH_WRITE)
     }
 
+    fn into_resource_state(self) -> D3D12_RESOURCE_STATES {
+        let mut out = D3D12_RESOURCE_FLAG_NONE;
+
+        if self.contains(TransitionFlags::RENDER_TARGET) {
+            out |= D3D12_RESOURCE_STATE_RENDER_TARGET;
+        }
+
+        if self.contains(TransitionFlags::DEPTH_WRITE) {
+            out |= D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        }
+
+        if self.contains(TransitionFlags::SHADER_RESOURCE) {
+            out |= D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        }
+
+        if self.contains(TransitionFlags::DEPTH_READ) {
+            out |= D3D12_RESOURCE_STATE_DEPTH_READ;
+        }
+
+        out
+    }
+
     fn into_resource_flags(self) -> D3D12_RESOURCE_FLAGS {
         let mut out = D3D12_RESOURCE_FLAG_NONE;
 
@@ -154,6 +176,50 @@ struct ResourceTransition {
     to: TransitionFlags
 }
 
+enum ResourceBarrier {
+    Transition(*mut ID3D12Resource, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES),
+    Alias(*mut ID3D12Resource, *mut ID3D12Resource)
+}
+
+impl Into<D3D12_RESOURCE_BARRIER> for ResourceBarrier {
+    fn into(self) -> D3D12_RESOURCE_BARRIER {
+        match self {
+            ResourceBarrier::Transition(resource, from, to) => {
+                unsafe {
+                    let mut barrier: D3D12_RESOURCE_BARRIER = ::std::mem::zeroed();
+
+                    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+
+                    (*barrier.u.Transition_mut()) = D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: resource,
+                        Subresource: 0,
+                        StateBefore: from,
+                        StateAfter: to,
+                    };
+
+                    barrier
+                }
+            },
+            ResourceBarrier::Alias(before, after) => {
+                unsafe {
+                    let mut barrier: D3D12_RESOURCE_BARRIER = ::std::mem::zeroed();
+
+                    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+                    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+
+                    (*barrier.u.Aliasing_mut()) = D3D12_RESOURCE_ALIASING_BARRIER {
+                        pResourceBefore: before,
+                        pResourceAfter: after
+                    };
+
+                    barrier
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 pub struct TransientResourceLifetime {
     pub start: u32,
@@ -190,6 +256,7 @@ pub struct FrameGraph {
     renderpasses: Vec<RenderPass>,
     // transitions too? at least aliasing
     renderpass_transitions: Vec<Vec<ResourceTransition>>,
+    final_transitions: Vec<Option<TransitionFlags>>,
 
     resources: Vec<TransientResource>,
     views: Vec<ResourceView>,
@@ -205,6 +272,7 @@ impl FrameGraph {
             device,
             renderpasses: Vec::new(),
             renderpass_transitions: Vec::new(),
+            final_transitions: Vec::new(),
             resources: Vec::new(),
             views: Vec::new(),
             heaps: HeapMemoryAllocator::new(device),
@@ -238,7 +306,8 @@ impl FrameGraph {
                 resource_id: resource.resource_id,
                 usage: resource.flags,
                 lifetime: TransientResourceLifetime { start: 0, end: 0 },
-                size: size as _,
+                // TODO: temp
+                size: size + alignment ,
                 alignment: alignment as _,
                 desc: resource.desc,
                 name: resource.name
@@ -347,6 +416,7 @@ impl FrameGraph {
         let mut aggregate_state = vec![TransitionFlags::empty(); self.resources.len()];
 
         self.renderpass_transitions.resize(self.renderpasses.len(), Vec::new());
+        self.final_transitions.resize(self.resources.len(), None);
 
         for (i, pass) in self.renderpasses.iter().enumerate() {
             for resource in &pass.resources {
@@ -354,6 +424,17 @@ impl FrameGraph {
 
                 let transition = resource.1;
                 let prev_transition = prev_states[idx];
+
+                // TODO: disjoint barriers?
+                if let Some(last) = self.final_transitions[idx] {
+                    self.renderpass_transitions[i].push(ResourceTransition {
+                        resource: resource.0,
+                        from: last,
+                        to: transition
+                    });
+
+                    self.final_transitions[idx] = None;
+                }
 
                 aggregate_state[idx].insert(transition);
 
@@ -402,11 +483,14 @@ impl FrameGraph {
                 prev_passes[idx] = i;
             }
         }
+        println!("{:#?}", self.final_transitions);
+
 
         for i in 0..self.resources.len() {
             let prev_state = prev_states[i];
             let current_state = current_states[i];
 
+            self.final_transitions[i] = Some(current_state);
             if prev_state != current_state {
                 if let Some(pass_idx) = cache_passes[i] {
                     self.renderpass_transitions[pass_idx].push(ResourceTransition {
@@ -414,9 +498,12 @@ impl FrameGraph {
                         from: prev_state,
                         to: current_state
                     });
+
                 }
             }
         }
+
+        println!("{:#?}", self.renderpass_transitions);
 
         for (idx, resource) in self.resources.iter_mut().enumerate() {
             resource.desc.Flags = aggregate_state[idx].into_resource_flags();
@@ -431,31 +518,32 @@ impl FrameGraph {
         self.cull();
         let elapsed = now.elapsed();
         let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
-        println!("Cull: {}us", sec);
+        //println!("Cull: {}us", sec);
 
         let now = Instant::now();
         self.find_lifetimes();
         let elapsed = now.elapsed();
         let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
-        println!("Lifetimes: {}us", sec);
+        //println!("Lifetimes: {}us", sec);
 
         let now = Instant::now();
         self.generate_barriers();
         let elapsed = now.elapsed();
         let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
-        println!("GenBarriers: {}us", sec);
+        //println!("GenBarriers: {}us", sec);
 
         let now = Instant::now();
         let mem = self.heaps.pack_heap(&self.resources, &self.views);
         let elapsed = now.elapsed();
         let sec = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1000.0);
-        println!("PackHeaps: {}us", sec);
+        //println!("PackHeaps: {}us", sec);
     }
 
     pub fn exec(&mut self, list: *mut ID3D12GraphicsCommandList) {
         let entry = self.heaps.current();
 
-        for pass in self.renderpasses.iter_mut() {
+        println!("{}", "exec!");
+        for (pass, trans) in self.renderpasses.iter_mut().zip(self.renderpass_transitions.iter()) {
             let mut data = vec![0xfeu8; pass.param_size];
             let mut cur = 0;
 
@@ -477,6 +565,21 @@ impl FrameGraph {
 
                     cur += sz;
                 }
+            }
+
+            // TODO: batch barrier calls
+
+            for transition in trans {
+                let res = self.heaps.get_placed_resource_ptr(transition.resource as usize);
+
+                let barrier = ResourceBarrier::Transition(
+                    res,
+                    transition.from.into_resource_state(),
+                    transition.to.into_resource_state()
+                ).into();
+
+                println!("Barrier({:?}): {:?} => {:?}", res, transition.from, transition.to);
+                unsafe { (*list).ResourceBarrier(1, &barrier); }
             }
 
             (pass.exec)(list, unsafe { ::std::mem::transmute(data.as_ptr()) })
