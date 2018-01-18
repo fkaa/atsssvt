@@ -8,6 +8,9 @@ use framegraph::{
 use winapi::um::d3d12::*;
 use winapi::Interface;
 
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
+
 use std::ptr;
 
 #[derive(Debug, Copy, Clone)]
@@ -28,9 +31,16 @@ impl MemoryRegion {
         }
     }
 
+    // regions intersect fully (memory & timeline)
     pub fn intersects(&self, other: MemoryRegion) -> bool {
         self.start < other.end &&
         self.end > other.start &&
+        self.offset < other.offset + other.size &&
+        self.offset + self.size > other.offset
+    }
+
+    // regions share same memory, but not timeline
+    pub fn overlaps(&self, other: MemoryRegion) -> bool {
         self.offset < other.offset + other.size &&
         self.offset + self.size > other.offset
     }
@@ -104,7 +114,7 @@ impl HeapBin {
 pub struct HeapMemoryCacheEntry {
     hash: u64,
     #[derivative(Debug="ignore")]
-    resources: Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC)>,
+    resources: Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC, &'static str)>,
     #[derivative(Debug="ignore")]
     views: Vec<ResourceView>,
 
@@ -242,9 +252,9 @@ impl HeapMemoryAllocator {
         self.current().placed_resources[idx]
     }
 
-    fn resize(&mut self, resources: &Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC)>) {
+    fn resize(&mut self, resources: &Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC, &'static str)>) {
         // TODO: do we even need to sort *all* resources?
-        let mut cached_resources: Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC)> = Vec::new();
+        let mut cached_resources: Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC, &'static str)> = Vec::new();
         cached_resources.extend(resources);
         for entry in self.cache.iter() {
             if entry.hash != 0 {
@@ -355,8 +365,9 @@ impl HeapMemoryAllocator {
                     let mut resource: *mut ID3D12Resource = ptr::null_mut();
                     unsafe {
                         (*self.device).CreatePlacedResource(new_heaps[heap].heap, offset, &entry.resources[idx].2, D3D12_RESOURCE_STATE_RENDER_TARGET, ptr::null_mut(), &ID3D12Resource::uuidof(), &mut resource as *mut *mut _ as *mut *mut _);
+                        let name: Vec<u16> = OsStr::new(entry.resources[idx].3).encode_wide().chain(Some(0).into_iter()).collect::<Vec<u16>>();
+                        (*resource).SetName(name.as_ptr());
                     }
-
                     // TODO: probably should be in some order?
                     entry.placed_resources.push(resource);
                 }
@@ -370,7 +381,7 @@ impl HeapMemoryAllocator {
         self.cache.iter().position(|entry| entry.hash == hash)
     }
 
-    fn push_entry(&mut self, hash: u64, resources: Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC)>, views: &Vec<ResourceView>) -> &HeapMemoryCacheEntry {
+    fn push_entry(&mut self, hash: u64, resources: Vec<(u64, TransientResourceLifetime, D3D12_RESOURCE_DESC, &'static str)>, views: &Vec<ResourceView>) -> &HeapMemoryCacheEntry {
         for i in 0..7 {
             self.cache.swap(7 - i, 7 - i - 1);
         }
@@ -414,7 +425,7 @@ impl HeapMemoryAllocator {
         if let Some(entry) = self.find_entry(hash) {
             &self.cache[entry]
         } else {
-            let mut resources = resources.iter().map(|r| (r.size, r.lifetime, r.desc)).collect::<Vec<_>>();
+            let mut resources = resources.iter().map(|r| (r.size, r.lifetime, r.desc, r.name)).collect::<Vec<_>>();
             resources.sort_by(|a, b| (b.0).cmp(&a.0));
 
             self.push_entry(hash, resources, views)

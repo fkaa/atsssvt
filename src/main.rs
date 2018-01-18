@@ -237,7 +237,7 @@ fn main() {
                     builder.create_render_target("Color", desc)
                 },
                 Box::new(|list, color_rtv: &D3D12_CPU_DESCRIPTOR_HANDLE| {
-                    //println!("Inside exec closure! {:#x}", color_rtv.ptr);
+                    println!("Alias: {:#x}", color_rtv.ptr);
 
                     unsafe {
                         (*list).ClearRenderTargetView(*color_rtv, &[0.8f32, 0.4f32, 0.3f32, 1f32], 0, ::std::ptr::null_mut());
@@ -267,8 +267,11 @@ fn main() {
 
                     builder.create_render_target("ColorAlias", desc)
                 },
-                Box::new(|_list, _| {
-
+                Box::new(|list, color_rtv: &D3D12_CPU_DESCRIPTOR_HANDLE| {
+                    println!("Dummy Alias: {:#x}", color_rtv.ptr);
+                    unsafe {
+                        (*list).ClearRenderTargetView(*color_rtv, &[0.3f32, 0.8f32, 0.6f32, 1f32], 0, ::std::ptr::null_mut());
+                    }
                 })
             );
 

@@ -165,7 +165,7 @@ struct RenderPass {
     #[derivative(Debug="ignore")]
     exec: Box<FnMut(*mut ID3D12GraphicsCommandList, &())>,
     param_size: usize,
-    params: Vec<(bool, u32)>,
+    params: Vec<(bool, u32, u32)>,
     refcount: u32
 }
 
@@ -237,7 +237,7 @@ pub struct TransientResource {
     alignment: u64,
     #[derivative(Debug="ignore")]
     pub desc: D3D12_RESOURCE_DESC,
-    name: &'static str
+    pub name: &'static str
 }
 
 impl ::std::hash::Hash for TransientResource {
@@ -257,6 +257,7 @@ pub struct FrameGraph {
     // transitions too? at least aliasing
     renderpass_transitions: Vec<Vec<ResourceTransition>>,
     final_transitions: Vec<Option<TransitionFlags>>,
+    resource_aliasing: Vec<bool>,
 
     resources: Vec<TransientResource>,
     views: Vec<ResourceView>,
@@ -273,6 +274,7 @@ impl FrameGraph {
             renderpasses: Vec::new(),
             renderpass_transitions: Vec::new(),
             final_transitions: Vec::new(),
+            resource_aliasing: Vec::new(),
             resources: Vec::new(),
             views: Vec::new(),
             heaps: HeapMemoryAllocator::new(device),
@@ -322,7 +324,7 @@ impl FrameGraph {
             resources: builder.resources,
             views: builder.views,
             exec: exec,
-            params: output.get_virtual_resources().iter().zip(output.is_cpus().iter()).map(|(r, &b)| (b, r.view_id)).collect(),
+            params: output.get_virtual_resources().iter().zip(output.is_cpus().iter()).map(|(r, &b)| (b, r.view_id, r.resource_id)).collect(),
             param_size: output.is_cpus().iter().fold(0usize, |sum, &b| if b { ::std::mem::size_of::<D3D12_CPU_DESCRIPTOR_HANDLE>() } else { ::std::mem::size_of::<D3D12_GPU_DESCRIPTOR_HANDLE>() }),
             refcount: 0
         }));
@@ -417,6 +419,8 @@ impl FrameGraph {
 
         self.renderpass_transitions.resize(self.renderpasses.len(), Vec::new());
         self.final_transitions.resize(self.resources.len(), None);
+        self.resource_aliasing.clear();
+        self.resource_aliasing.resize(self.resources.len(), false);
 
         for (i, pass) in self.renderpasses.iter().enumerate() {
             for resource in &pass.resources {
@@ -483,6 +487,7 @@ impl FrameGraph {
                 prev_passes[idx] = i;
             }
         }
+
         println!("{:#?}", self.final_transitions);
 
 
@@ -544,11 +549,21 @@ impl FrameGraph {
 
         println!("{}", "exec!");
         for (pass, trans) in self.renderpasses.iter_mut().zip(self.renderpass_transitions.iter()) {
+            let mut barriers = Vec::new();
             let mut data = vec![0xfeu8; pass.param_size];
             let mut cur = 0;
 
             unsafe {
-                for &(b, id) in &pass.params {
+                println!("params: {:?}\naliasing: {:?}", pass.params, self.resource_aliasing);
+                for &(b, id, res_id) in &pass.params {
+                    let idx = res_id as usize;
+                    if !self.resource_aliasing[idx] {
+                        let res = self.heaps.get_placed_resource_ptr(idx);
+                        barriers.push(ResourceBarrier::Alias(::std::ptr::null_mut(), res).into());
+
+                        self.resource_aliasing[idx] = true;
+                    }
+
                     let sz = if b {
                         let handle: *const u8 = ::std::mem::transmute(&self.heaps.get_cpu_handle(id as usize));
                         let sz = ::std::mem::size_of::<D3D12_CPU_DESCRIPTOR_HANDLE>();
@@ -569,18 +584,23 @@ impl FrameGraph {
 
             // TODO: batch barrier calls
 
+
+
             for transition in trans {
                 let res = self.heaps.get_placed_resource_ptr(transition.resource as usize);
 
-                let barrier = ResourceBarrier::Transition(
+                let mut barrier: D3D12_RESOURCE_BARRIER = ResourceBarrier::Transition(
                     res,
                     transition.from.into_resource_state(),
                     transition.to.into_resource_state()
                 ).into();
 
-                println!("Barrier({:?}): {:?} => {:?}", res, transition.from, transition.to);
-                unsafe { (*list).ResourceBarrier(1, &barrier); }
+                barriers.push(barrier);
+
+                unsafe { let barrier = barrier.u.Transition_mut(); println!("Barrier({:?}): {:?} => {:?}", barrier.pResource, barrier.StateBefore, barrier.StateAfter); };
             }
+
+            unsafe { (*list).ResourceBarrier(barriers.len() as u32, barriers.as_ptr()); }
 
             (pass.exec)(list, unsafe { ::std::mem::transmute(data.as_ptr()) })
         }
@@ -647,7 +667,7 @@ impl FrameGraphBuilder {
         self.counter += 1;
         let res = FrameGraphResource {
             name: name,
-            view_id: 0,
+            view_id: self.view_counter,
             resource_id: virtual_id
         };
 
@@ -701,9 +721,11 @@ impl FrameGraphBuilder {
         self.counter += 1;
         let res = FrameGraphResource {
             name: name,
-            view_id: 0,
+            view_id: self.view_counter,
             resource_id: virtual_id
         };
+
+        self.view_counter += 1;
 
         let resource_desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
