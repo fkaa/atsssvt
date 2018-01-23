@@ -35,8 +35,10 @@ use winapi::Interface;
 
 mod alloc;
 mod framegraph;
+mod pipeline;
 
 use framegraph::*;
+use pipeline::*;
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
@@ -121,57 +123,30 @@ unsafe fn create_window(factory: *mut IDXGIFactory4, queue: *mut ID3D12CommandQu
 }
 
 fn main() {
-    ::std::thread::sleep(::std::time::Duration::from_millis(10000));
-    let (device, queue, hwnd, swapchain) = unsafe {
-        let mut debug_controller: *mut ID3D12Debug = ptr::null_mut();
-        if SUCCEEDED(D3D12GetDebugInterface(&ID3D12Debug::uuidof(), mem::transmute(&mut debug_controller))) {
-            (*debug_controller).EnableDebugLayer();
-        }
+    let (device, queue, hwnd, swapchain) = {
+        unsafe { enable_debug_layer(); }
 
-        let mut factory: *mut IDXGIFactory4 = ptr::null_mut();
-        if !SUCCEEDED(CreateDXGIFactory2(DXGI_CREATE_FACTORY_DEBUG, &IDXGIFactory1::uuidof(), mem::transmute(&mut factory))) {
-            panic!();
-        }
+        let factory = Factory::new(true).unwrap();
+        let adapter = factory.iter_adapters().next().unwrap();
 
-        let mut adapter: *mut IDXGIAdapter1 = ptr::null_mut();
-        let mut idx = 0;
-        while (*factory).EnumAdapters1(idx, &mut adapter as _) != DXGI_ERROR_NOT_FOUND {
-            let mut desc: DXGI_ADAPTER_DESC1 = mem::uninitialized();
-            if !SUCCEEDED((*adapter).GetDesc1(&mut desc)) {
-                idx = idx + 1;
-                continue;
-            }
+        println!("{:#?}", adapter.description());
 
-            if SUCCEEDED(D3D12CreateDevice(
-                mem::transmute(adapter),
+        let device = Device::from_adapter(adapter).unwrap();
+        
+        let (queue, hwnd, swapchain) = unsafe {
+            let mut queue: *mut ID3D12CommandQueue = ptr::null_mut();
+            let desc = D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                Priority: 0,
+                Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
+                NodeMask: 0
+            };
+            (*device.device).CreateCommandQueue(&desc, &ID3D12CommandQueue::uuidof(), &mut queue as *mut *mut _ as *mut *mut _);
 
-                D3D_FEATURE_LEVEL_11_0,
-                &ID3D12Device::uuidof(),
-                ptr::null_mut()))
-            {
-                break;
-            }
+            let (hwnd, swapchain) = create_window(factory.factory, queue);
 
-            idx = idx + 1;
-        }
-
-        let mut device: *mut ID3D12Device = ptr::null_mut();
-        D3D12CreateDevice(
-            mem::transmute(adapter.as_mut()),
-            D3D_FEATURE_LEVEL_11_0,
-            &ID3D12Device::uuidof(),
-            mem::transmute(&mut device));
-
-        let mut queue: *mut ID3D12CommandQueue = ptr::null_mut();
-        let desc = D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-            Priority: 0,
-            Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
-            NodeMask: 0
+            (queue, hwnd, swapchain)
         };
-        (*device).CreateCommandQueue(&desc, &ID3D12CommandQueue::uuidof(), &mut queue as *mut *mut _ as *mut *mut _);
-
-        let (hwnd, swapchain) = create_window(factory, queue);
 
         (device, queue, hwnd, swapchain)
     };
@@ -180,10 +155,10 @@ fn main() {
 
     let (allocator, list) = unsafe {
         let mut allocator: *mut ID3D12CommandAllocator = ptr::null_mut();
-        (*device).CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, &ID3D12CommandAllocator::uuidof(), &mut allocator as *mut *mut _ as *mut *mut _);
+        (*device.device).CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, &ID3D12CommandAllocator::uuidof(), &mut allocator as *mut *mut _ as *mut *mut _);
 
         let mut list: *mut ID3D12GraphicsCommandList = ptr::null_mut();
-        let hr = (*device).CreateCommandList(
+        let hr = (*device.device).CreateCommandList(
             0,
             D3D12_COMMAND_LIST_TYPE_DIRECT,
             allocator,
@@ -200,7 +175,7 @@ fn main() {
 
     let (fence, fence_event) = unsafe {
         let mut fence: *mut ID3D12Fence = ptr::null_mut();
-        (*device).CreateFence(0, D3D12_FENCE_FLAG_NONE, &ID3D12Fence::uuidof(), &mut fence as *mut *mut _ as *mut *mut _);
+        (*device.device).CreateFence(0, D3D12_FENCE_FLAG_NONE, &ID3D12Fence::uuidof(), &mut fence as *mut *mut _ as *mut *mut _);
 
         let fence_event = CreateEventW(ptr::null_mut(), FALSE, FALSE, ptr::null_mut());
 
@@ -209,7 +184,56 @@ fn main() {
 
     let mut fence_value = 1u64;
 
-    let mut fg = FrameGraph::new(device);
+    let mut fg = FrameGraph::new(device.device);
+
+    let desc = GraphicsPipelineDescription {
+        vertex_shader: ShaderBlob::from_file("Basic.v"),
+        pixel_shader: Some(ShaderBlob::from_file("Basic.p")),
+        domain_shader: None,
+        hull_shader: None,
+        geometry_shader: None,
+        blend_state: BlendDesc {
+            alpha_to_coverage: false,
+            independent_blend: false,
+            render_target: [None; 8]
+        },
+        sample_mask: 0x0,
+        rasterizer_state: RasterizerDesc {
+            fill_mode: FillMode::Solid,
+            cull_mode: CullMode::None,
+            front_counter_clockwise: false,
+            depth_bias: 0,
+            depth_bias_clamp: 0f32,
+            slope_scaled_depth_bias: 0f32,
+            depth_clip_enable: false,
+            multisample_enable: false,
+            antialiased_line_enable: false,
+            forced_sample_count: 0,
+            conservative_raster: ConservativeRasterization::Off
+        },
+        depth_stencil_state: DepthStencilDesc::disabled(),
+        input_layout: InputLayoutDesc {
+            elements: vec![
+                InputElementDesc::new(String::from("POSITION"), 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, InputClassification::PerVertexData, 0),
+                InputElementDesc::new(String::from("NORMAL"), 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, InputClassification::PerVertexData, 0),
+                InputElementDesc::new(String::from("TEXCOORD"), 0, DXGI_FORMAT_R32G32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, InputClassification::PerVertexData, 0),
+            ]
+        },
+        primitive_topology_type: PrimitiveTopologyType::Triangle,
+        render_targets: [
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_UNKNOWN,
+        ],
+        dsv_format: DXGI_FORMAT_D32_FLOAT
+    };
+
+    let pipeline = device.create_graphics_pipeline(&desc).unwrap();
 
     unsafe {
         let mut msg = mem::zeroed();
@@ -237,7 +261,7 @@ fn main() {
                     builder.create_render_target("Color", desc)
                 },
                 Box::new(|list, color_rtv: &D3D12_CPU_DESCRIPTOR_HANDLE| {
-                    println!("Alias: {:#x}", color_rtv.ptr);
+                    //println!("Alias: {:#x}", color_rtv.ptr);
 
                     unsafe {
                         (*list).ClearRenderTargetView(*color_rtv, &[0.8f32, 0.4f32, 0.3f32, 1f32], 0, ::std::ptr::null_mut());
@@ -268,7 +292,7 @@ fn main() {
                     builder.create_render_target("ColorAlias", desc)
                 },
                 Box::new(|list, color_rtv: &D3D12_CPU_DESCRIPTOR_HANDLE| {
-                    println!("Dummy Alias: {:#x}", color_rtv.ptr);
+                    //println!("Dummy Alias: {:#x}", color_rtv.ptr);
                     unsafe {
                         (*list).ClearRenderTargetView(*color_rtv, &[0.3f32, 0.8f32, 0.6f32, 1f32], 0, ::std::ptr::null_mut());
                     }

@@ -488,7 +488,7 @@ impl FrameGraph {
             }
         }
 
-        println!("{:#?}", self.final_transitions);
+        //println!("{:#?}", self.final_transitions);
 
 
         for i in 0..self.resources.len() {
@@ -508,7 +508,7 @@ impl FrameGraph {
             }
         }
 
-        println!("{:#?}", self.renderpass_transitions);
+        //println!("{:#?}", self.renderpass_transitions);
 
         for (idx, resource) in self.resources.iter_mut().enumerate() {
             resource.desc.Flags = aggregate_state[idx].into_resource_flags();
@@ -547,14 +547,13 @@ impl FrameGraph {
     pub fn exec(&mut self, list: *mut ID3D12GraphicsCommandList) {
         let entry = self.heaps.current();
 
-        println!("{}", "exec!");
+        //println!("{}", "exec!");
         for (pass, trans) in self.renderpasses.iter_mut().zip(self.renderpass_transitions.iter()) {
             let mut barriers = Vec::new();
             let mut data = vec![0xfeu8; pass.param_size];
             let mut cur = 0;
 
             unsafe {
-                println!("params: {:?}\naliasing: {:?}", pass.params, self.resource_aliasing);
                 for &(b, id, res_id) in &pass.params {
                     let idx = res_id as usize;
                     if !self.resource_aliasing[idx] {
@@ -582,10 +581,6 @@ impl FrameGraph {
                 }
             }
 
-            // TODO: batch barrier calls
-
-
-
             for transition in trans {
                 let res = self.heaps.get_placed_resource_ptr(transition.resource as usize);
 
@@ -597,7 +592,18 @@ impl FrameGraph {
 
                 barriers.push(barrier);
 
-                unsafe { let barrier = barrier.u.Transition_mut(); println!("Barrier({:?}): {:?} => {:?}", barrier.pResource, barrier.StateBefore, barrier.StateAfter); };
+            }
+
+            for barrier in &mut barriers {
+                unsafe {
+                    if barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION {
+                        let barrier = barrier.u.Transition_mut();
+                        //println!("Transition({:?}): {:?} => {:?}", barrier.pResource, barrier.StateBefore, barrier.StateAfter);
+                    } else if barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING {
+                        let barrier = barrier.u.Aliasing_mut();
+                        //println!("Alias({:?} => {:?})", barrier.pResourceBefore, barrier.pResourceAfter);
+                    }
+                };
             }
 
             unsafe { (*list).ResourceBarrier(barriers.len() as u32, barriers.as_ptr()); }
